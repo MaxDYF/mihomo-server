@@ -1,0 +1,17 @@
+# runtime
+cache.db
+*.log
+*.pid
+
+# user data / generated config
+config.yaml
+config.base.yaml
+config.yaml.bak-inline
+subs/
+
+# binaries and archives
+mihomo
+clash
+*.backup
+*.tar.gz
+Country.mmdb

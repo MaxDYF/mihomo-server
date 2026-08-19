@@ -1,0 +1,735 @@
+# vpn.sh — Mihomo 代理控制函数（通过 source 加载，作用于当前 shell）
+#
+# 用法：
+#   vpn on       启动/确认 Mihomo 进程，并开启当前终端代理
+#   vpn off      关闭当前终端代理（不停止 Mihomo 进程）
+#   vpn stop     停止 Mihomo 进程（同时关闭代理）
+#   vpn status   查看 Mihomo 进程、端口、代理、订阅状态
+#   vpn restart  重启 Mihomo 进程
+#   vpn log      查看 Mihomo 最近日志
+#   vpn sub ...  订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
+#
+# 设计要点：
+#   - 进程控制用 PID 文件和 kill，避免按模糊进程名误杀
+#   - 代理开关用 export，只对当前 shell 生效
+#   - 兼容旧的 CLASH_* 环境变量和 unvpn 函数名
+#   - 订阅通过 mihomo proxy-providers (type: file) 加载，config.yaml 由
+#     config.base.yaml + 当前订阅自动生成；vpn on/restart 自动检查更新
+
+# ---- 配置区（如需修改端口或路径，改这里即可）----
+# CLASH_* 保留为兼容别名；新的配置优先使用 MIHOMO_*。
+MIHOMO_DIR="${MIHOMO_DIR:-${CLASH_DIR:-$HOME/clash}}"
+MIHOMO_BIN="${MIHOMO_BIN:-${CLASH_BIN:-$MIHOMO_DIR/mihomo}}"
+MIHOMO_LOG="${MIHOMO_LOG:-${CLASH_LOG:-$MIHOMO_DIR/mihomo.log}}"
+MIHOMO_PIDFILE="${MIHOMO_PIDFILE:-$MIHOMO_DIR/mihomo.pid}"
+PROXY_PORT="${PROXY_PORT:-7890}"
+SOCKS_PORT="${SOCKS_PORT:-7891}"
+HTTP_PORT="${HTTP_PORT:-7892}"
+LISTEN_PORTS="${LISTEN_PORTS:-$PROXY_PORT $SOCKS_PORT $HTTP_PORT}"
+NO_PROXY_LIST="localhost,127.0.0.1,::1,*.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1"
+
+# ---- 订阅配置 ----
+SUBS_DIR="${SUBS_DIR:-$MIHOMO_DIR/subs}"
+SUBS_LIST="${SUBS_LIST:-$SUBS_DIR/subs.list}"
+SUBS_ACTIVE="${SUBS_ACTIVE:-$SUBS_DIR/subs.active}"
+SUBS_AUTO="${SUBS_AUTO:-$SUBS_DIR/subs.auto}"
+BASE_CONFIG="${BASE_CONFIG:-$MIHOMO_DIR/config.base.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-$MIHOMO_DIR/config.yaml}"
+SUB_UPDATE_INTERVAL="${SUB_UPDATE_INTERVAL:-86400}"   # 自动更新间隔（秒），默认 24h
+SUB_DOWNLOAD_TIMEOUT="${SUB_DOWNLOAD_TIMEOUT:-30}"
+SUB_UA="${SUB_UA:-clash-verge/v2.0.0}"
+SUB_HEALTH_URL="${SUB_HEALTH_URL:-http://cp.cloudflare.com/generate_204}"
+
+# ---- 内部辅助 ----
+_vpn_mihomo_pid() {
+    local pid
+
+    if [ -r "$MIHOMO_PIDFILE" ]; then
+        read -r pid < "$MIHOMO_PIDFILE"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+            && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null \
+                | grep -Fq -- "$MIHOMO_BIN -d $MIHOMO_DIR"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        rm -f "$MIHOMO_PIDFILE"
+    fi
+
+    pgrep -x -f -- "$MIHOMO_BIN -d $MIHOMO_DIR" | head -n 1
+}
+
+_vpn_mihomo_running() {
+    [ -n "$(_vpn_mihomo_pid)" ]
+}
+
+_vpn_port_listening() {
+    ss -ltnH 2>/dev/null | grep -Eq ":${1}[[:space:]]"
+}
+
+_vpn_start_mihomo() {
+    local pid i
+    pid="$(_vpn_mihomo_pid)"
+    if [ -n "$pid" ]; then
+        echo "[vpn] Mihomo 已在运行（PID: $pid）"
+        return 0
+    fi
+
+    if [ ! -x "$MIHOMO_BIN" ]; then
+        echo "[vpn] 错误：找不到可执行文件 $MIHOMO_BIN" >&2
+        return 1
+    fi
+
+    nohup "$MIHOMO_BIN" -d "$MIHOMO_DIR" >> "$MIHOMO_LOG" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$MIHOMO_PIDFILE"
+
+    # 等混合代理端口起来
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$MIHOMO_PIDFILE"
+            echo "[vpn] Mihomo 启动失败，请查看日志：tail -f $MIHOMO_LOG" >&2
+            return 1
+        fi
+        if _vpn_port_listening "$PROXY_PORT"; then
+            echo "[vpn] Mihomo 已启动（PID: $pid），监听 :$PROXY_PORT"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    echo "[vpn] 警告：启动 5s 后端口 $PROXY_PORT 仍未监听，请查看日志：tail -f $MIHOMO_LOG" >&2
+    echo "[vpn] 进程 PID: $pid"
+    return 1
+}
+
+_vpn_stop_mihomo() {
+    local pid i
+    pid="$(_vpn_mihomo_pid)"
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+            sleep 0.5
+        fi
+        rm -f "$MIHOMO_PIDFILE"
+        echo "[vpn] Mihomo 进程已停止"
+    else
+        echo "[vpn] Mihomo 未在运行"
+    fi
+}
+
+_vpn_set_proxy() {
+    export http_proxy="http://127.0.0.1:$PROXY_PORT"
+    export https_proxy="http://127.0.0.1:$PROXY_PORT"
+    export HTTP_PROXY="http://127.0.0.1:$PROXY_PORT"
+    export HTTPS_PROXY="http://127.0.0.1:$PROXY_PORT"
+    export all_proxy="socks5://127.0.0.1:$SOCKS_PORT"
+    export ALL_PROXY="socks5://127.0.0.1:$SOCKS_PORT"
+    export no_proxy="$NO_PROXY_LIST"
+    export NO_PROXY="$NO_PROXY_LIST"
+}
+
+_vpn_unset_proxy() {
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+}
+
+_vpn_test() {
+    local url="$1"
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$url" 2>/dev/null)
+    if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+        echo "  ✓ $url  →  HTTP $code"
+    else
+        echo "  ✗ $url  →  HTTP $code (失败)"
+    fi
+}
+
+# ---- 订阅管理 ----
+_vpn_sub_py() {
+    python3 - "$@" <<'PYEOF'
+import sys, yaml, base64
+
+def doc_proxies(doc):
+    if isinstance(doc, dict):
+        for k in ('proxies', 'Proxy'):
+            if isinstance(doc.get(k), list):
+                return doc[k]
+    if isinstance(doc, list):
+        return doc
+    return None
+
+def load(text):
+    try:
+        return yaml.safe_load(text)
+    except Exception:
+        return None
+
+def maybe_base64(text):
+    try:
+        t = text.strip().translate(str.maketrans('', '', ' \t\r\n'))
+        t += '=' * ((4 - len(t) % 4) % 4)
+        dec = base64.b64decode(t).decode('utf-8', errors='replace')
+        return dec if doc_proxies(load(dec)) is not None else None
+    except Exception:
+        return None
+
+cmd = sys.argv[1]
+
+if cmd == 'extract':
+    # 原始订阅文件 -> 规范化代理列表文件；成功输出节点数
+    raw, out = sys.argv[2], sys.argv[3]
+    text = open(raw, encoding='utf-8', errors='replace').read()
+    doc = load(text)
+    proxies = doc_proxies(doc)
+    if proxies is None:
+        dec = maybe_base64(text)
+        if dec is not None:
+            doc = load(dec)
+            proxies = doc_proxies(doc)
+    if proxies is None:
+        sys.exit('no proxy list found')
+    seen, cleaned = {}, []
+    for p in proxies:
+        if not isinstance(p, dict) or not isinstance(p.get('name'), str) \
+                or not isinstance(p.get('type'), str) or not p['name']:
+            continue
+        name = p['name']
+        if name in seen:
+            seen[name] += 1
+            p = dict(p)
+            p['name'] = '%s (%d)' % (name, seen[name])
+        else:
+            seen[name] = 0
+        cleaned.append(p)
+    if not cleaned:
+        sys.exit('empty proxy list')
+    with open(out, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(cleaned, f, allow_unicode=True, sort_keys=False)
+    print(len(cleaned))
+
+elif cmd == 'migrate':
+    # 现有 config.yaml -> base 配置 + 默认订阅代理列表；输出节点数
+    src, base_out, prov_out = sys.argv[2], sys.argv[3], sys.argv[4]
+    doc = load(open(src, encoding='utf-8').read()) or {}
+    proxies = doc.get('proxies') or []
+    for k in ('proxies', 'proxy-providers', 'proxy-groups'):
+        doc.pop(k, None)
+    with open(base_out, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False)
+    with open(prov_out, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(proxies, f, allow_unicode=True, sort_keys=False)
+    print(len(proxies))
+
+elif cmd == 'minimal':
+    # 无任何配置时生成最小 base 配置
+    with open(sys.argv[2], 'w', encoding='utf-8') as f:
+        yaml.safe_dump({
+            'mixed-port': 7890,
+            'allow-lan': True,
+            'mode': 'rule',
+            'log-level': 'info',
+            'dns': {'enable': True, 'enhanced-mode': 'fake-ip', 'nameserver': ['223.5.5.5']},
+            'rules': ['MATCH,🚀节点选择'],
+        }, f, allow_unicode=True, sort_keys=False)
+    print('ok')
+
+elif cmd == 'gen':
+    # base + 当前订阅 -> config.yaml
+    base_file, out, pid, pfile = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+    base = load(open(base_file, encoding='utf-8').read()) or {}
+    for k in ('proxies', 'proxy-providers', 'proxy-groups'):
+        base.pop(k, None)
+    base['proxy-providers'] = {
+        pid: {
+            'type': 'file',
+            'path': pfile,
+            'health-check': {
+                'enable': True,
+                'url': sys.argv[6] if len(sys.argv) > 6 else 'http://cp.cloudflare.com/generate_204',
+                'interval': 300,
+            },
+        }
+    }
+    base['proxy-groups'] = [
+        {'name': '🚀节点选择', 'type': 'select',
+         'proxies': ['♻️自动选择', 'DIRECT'], 'use': [pid]},
+        {'name': '♻️自动选择', 'type': 'url-test',
+         'url': 'http://cp.cloudflare.com/generate_204', 'interval': 300, 'use': [pid]},
+        {'name': '🐟漏网之鱼', 'type': 'select',
+         'proxies': ['🚀节点选择', 'DIRECT']},
+        {'name': '🛑广告拦截', 'type': 'select',
+         'proxies': ['REJECT', 'DIRECT']},
+    ]
+    with open(out, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(base, f, allow_unicode=True, sort_keys=False)
+    print('ok')
+PYEOF
+}
+
+_vpn_sub_entry() {
+    awk -F '\t' -v k="$1" '$1==k || $2==k {print; exit}' "$SUBS_LIST" 2>/dev/null
+}
+
+_vpn_sub_id() {
+    local line
+    line=$(_vpn_sub_entry "$1")
+    [ -n "$line" ] && printf '%s\n' "$line" | cut -f1
+}
+
+_vpn_sub_url_decode() {
+    local url="$1"
+    case "$url" in
+        sub://*)
+            python3 -c '
+import sys, base64
+s = sys.argv[1][6:]
+s += "=" * ((4 - len(s) % 4) % 4)
+print(base64.urlsafe_b64decode(s).decode("utf-8"), end="")' "$url" 2>/dev/null \
+                || printf '%s' "$url"
+            ;;
+        *) printf '%s' "$url" ;;
+    esac
+}
+
+_vpn_sub_fetch() {
+    local url="$1" out="$2" real
+    real=$(_vpn_sub_url_decode "$url")
+    curl -fsSL --max-time "$SUB_DOWNLOAD_TIMEOUT" --retry 1 \
+        -A "$SUB_UA" -o "$out" "$real" 2>/dev/null
+}
+
+_vpn_sub_normalize() {
+    local raw="$1" out="$2"
+    _vpn_sub_py extract "$raw" "$out"
+}
+
+_vpn_sub_ensure() {
+    mkdir -p "$SUBS_DIR"
+
+    # 首次使用：把现有 config.yaml 的 proxies/proxy-groups 抽离为「默认订阅」
+    if [ ! -f "$SUBS_LIST" ]; then
+        if [ -f "$CONFIG_FILE" ]; then
+            n=$(_vpn_sub_py migrate "$CONFIG_FILE" "$BASE_CONFIG" "$SUBS_DIR/sub_1.yaml")
+            if [ $? -eq 0 ] && [ -n "$n" ]; then
+                cp -f "$CONFIG_FILE" "$CONFIG_FILE.bak-inline" 2>/dev/null || true
+                printf 'sub_1\t默认订阅\tlocal\t%s\n' "$(date +%s)" > "$SUBS_LIST"
+                printf '%s\n' sub_1 > "$SUBS_ACTIVE"
+                printf '1\n' > "$SUBS_AUTO"
+                if [ "$n" -gt 0 ] 2>/dev/null && _vpn_sub_gen_config sub_1; then
+                    echo "[vpn] 已将现有 config.yaml 抽离为基础配置 + 默认订阅（$n 个节点）"
+                    echo "[vpn] 原配置备份: $CONFIG_FILE.bak-inline，基础模板: $BASE_CONFIG"
+                fi
+            else
+                : > "$SUBS_LIST"
+                echo "[vpn] 警告：现有 config.yaml 迁移失败，未创建默认订阅" >&2
+            fi
+        else
+            : > "$SUBS_LIST"
+        fi
+    fi
+
+    # 无基础配置时生成最小模板（仅首次且无 config.yaml 时）
+    if [ ! -f "$BASE_CONFIG" ] && [ ! -f "$CONFIG_FILE" ]; then
+        _vpn_sub_py minimal "$BASE_CONFIG" >/dev/null 2>&1 \
+            && echo "[vpn] 已生成最小基础配置 $BASE_CONFIG"
+    fi
+
+    # config.yaml 缺失时按当前订阅重新生成
+    if [ ! -f "$CONFIG_FILE" ] && [ -s "$SUBS_ACTIVE" ] 2>/dev/null; then
+        _vpn_sub_gen_config "$(cat "$SUBS_ACTIVE")"
+    fi
+}
+
+_vpn_sub_gen_config() {
+    local id="$1"
+    [ -f "$BASE_CONFIG" ] || { echo "[vpn] 错误：缺少基础配置 $BASE_CONFIG" >&2; return 1; }
+    [ -f "$SUBS_DIR/$id.yaml" ] || { echo "[vpn] 错误：缺少订阅文件 $SUBS_DIR/$id.yaml" >&2; return 1; }
+    _vpn_sub_py gen "$BASE_CONFIG" "$CONFIG_FILE" "$id" "subs/$id.yaml" "$SUB_HEALTH_URL" >/dev/null || {
+        echo "[vpn] 生成 $CONFIG_FILE 失败" >&2
+        return 1
+    }
+    return 0
+}
+
+_vpn_sub_update_one() {
+    # 返回值：0=有更新 1=失败 2=无变化
+    local id="$1" url raw tmp out n rc
+    url=$(awk -F '\t' -v id="$id" '$1==id {print $3}' "$SUBS_LIST")
+    if [ -z "$url" ] || [ "$url" = "local" ]; then
+        echo "  - $id: 本地订阅，无可更新 URL"
+        return 2
+    fi
+    tmp="$SUBS_DIR/.$id.dl.$$"
+    if ! _vpn_sub_fetch "$url" "$tmp"; then
+        rm -f "$tmp"
+        echo "  ✗ $id: 下载失败"
+        return 1
+    fi
+    out="$SUBS_DIR/.$id.nm.$$"
+    if ! n=$(_vpn_sub_normalize "$tmp" "$out"); then
+        rm -f "$tmp" "$out"
+        echo "  ✗ $id: 订阅内容解析失败"
+        return 1
+    fi
+    if cmp -s "$out" "$SUBS_DIR/$id.yaml" 2>/dev/null; then
+        rc=2
+        msg="= $id: 无变化（$n 个节点）"
+    else
+        rc=0
+        mv -f "$tmp" "$SUBS_DIR/$id.raw"
+        mv -f "$out" "$SUBS_DIR/$id.yaml"
+        msg="✓ $id: 已更新（$n 个节点）"
+    fi
+    rm -f "$tmp" "$out"
+    awk -F '\t' -v id="$id" -v now="$(date +%s)" \
+        'BEGIN{OFS="\t"} $1==id {$4=now} {print}' "$SUBS_LIST" > "$SUBS_LIST.tmp" \
+        && mv -f "$SUBS_LIST.tmp" "$SUBS_LIST"
+    echo "$msg"
+    return $rc
+}
+
+_vpn_sub_check() {
+    # 供 vpn on / vpn restart 调用：到时间才更新，否则静默
+    _vpn_sub_ensure
+    [ -s "$SUBS_ACTIVE" ] 2>/dev/null || return 0
+    [ "$(cat "$SUBS_AUTO" 2>/dev/null)" = "1" ] || return 0
+    local id epoch now
+    id=$(cat "$SUBS_ACTIVE")
+    epoch=$(awk -F '\t' -v id="$id" '$1==id {print $4}' "$SUBS_LIST")
+    [ -n "$epoch" ] || return 0
+    now=$(date +%s)
+    [ $((now - epoch)) -lt "$SUB_UPDATE_INTERVAL" ] && return 0
+    echo "[vpn] 当前订阅已超过 $((SUB_UPDATE_INTERVAL / 3600))h 未更新，开始自动更新..."
+    _vpn_sub_update_one "$id"
+    local rc=$?
+    if [ "$rc" = "0" ] && _vpn_mihomo_running; then
+        echo "[vpn] 订阅已更新，重启 Mihomo 生效..."
+        vpn restart
+    elif [ "$rc" = "1" ]; then
+        echo "[vpn] 自动更新失败（可能网络不通），继续使用现有配置"
+    fi
+}
+
+_vpn_sub_restart() {
+    vpn restart
+}
+
+vpn_sub() {
+    local cmd="${1:-list}"
+    case "$cmd" in
+        list|ls)
+            _vpn_sub_ensure
+            local i=0 id name url epoch active_id mark n total auto
+            active_id=$(cat "$SUBS_ACTIVE" 2>/dev/null || true)
+            total=$(wc -l < "$SUBS_LIST" 2>/dev/null || echo 0)
+            echo "===== 订阅列表（$total 个）====="
+            while IFS=$'\t' read -r id name url epoch; do
+                [ -n "$id" ] || continue
+                i=$((i + 1))
+                [ "$id" = "$active_id" ] && mark="*" || mark=" "
+                n=$(grep -c '^- name:' "$SUBS_DIR/$id.yaml" 2>/dev/null)
+                n=${n:-0}
+                printf '%s %d. %-20s [%s] 节点:%-5s 更新:%s\n' \
+                    "$mark" "$i" "$name" "$id" "$n" \
+                    "$(date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 未知)"
+            done < "$SUBS_LIST"
+            [ "$total" = "0" ] && echo "  暂无订阅，添加: vpn sub add <订阅URL> [名称]"
+            auto=$(cat "$SUBS_AUTO" 2>/dev/null)
+            [ "$auto" = "1" ] && auto=开 || auto=关
+            echo "自动更新: $auto（间隔 $((SUB_UPDATE_INTERVAL / 3600))h，vpn on/restart 时检查）"
+            ;;
+
+        add)
+            _vpn_sub_ensure
+            local url="$2" name="$3" id next n tmp
+            if [ -z "$url" ]; then
+                echo "用法: vpn sub add <订阅URL> [名称]" >&2
+                return 1
+            fi
+            next=$(($(wc -l < "$SUBS_LIST" 2>/dev/null) + 1))
+            while grep -qF "$(printf 'sub_%s\t' "$next")" "$SUBS_LIST" 2>/dev/null; do
+                next=$((next + 1))
+            done
+            id="sub_$next"
+            [ -n "$name" ] || name="订阅-$next"
+            name=$(printf '%s' "$name" | tr '\t\n' '  ')
+            echo "[vpn] 正在下载订阅..."
+            tmp="$SUBS_DIR/.$id.dl.$$"
+            if ! _vpn_sub_fetch "$url" "$tmp"; then
+                rm -f "$tmp"
+                echo "[vpn] 下载失败，请检查 URL 与网络" >&2
+                return 1
+            fi
+            if ! n=$(_vpn_sub_normalize "$tmp" "$SUBS_DIR/$id.yaml"); then
+                rm -f "$tmp"
+                echo "[vpn] 订阅内容解析失败（需为 Clash 配置 / 代理列表 / base64 订阅）" >&2
+                return 1
+            fi
+            mv -f "$tmp" "$SUBS_DIR/$id.raw"
+            printf '%s\t%s\t%s\t%s\n' "$id" "$name" "$url" "$(date +%s)" >> "$SUBS_LIST"
+            echo "[vpn] 已添加订阅「$name」（$id），$n 个节点"
+            if [ ! -s "$SUBS_ACTIVE" ] 2>/dev/null; then
+                printf '%s\n' "$id" > "$SUBS_ACTIVE"
+                if _vpn_sub_gen_config "$id"; then
+                    echo "[vpn] 已设为当前订阅"
+                    _vpn_mihomo_running && _vpn_sub_restart
+                fi
+            fi
+            ;;
+
+        use|switch|select)
+            _vpn_sub_ensure
+            local key="$2" id name
+            if [ -z "$key" ]; then
+                echo "用法: vpn sub use <名称|ID>" >&2
+                return 1
+            fi
+            id=$(_vpn_sub_id "$key")
+            if [ -z "$id" ]; then
+                echo "[vpn] 找不到订阅: $key（vpn sub list 查看）" >&2
+                return 1
+            fi
+            printf '%s\n' "$id" > "$SUBS_ACTIVE"
+            if ! _vpn_sub_gen_config "$id"; then return 1; fi
+            name=$(awk -F '\t' -v id="$id" '$1==id {print $2}' "$SUBS_LIST")
+            echo "[vpn] 已切换到订阅「$name」（$id）"
+            _vpn_mihomo_running && _vpn_sub_restart
+            ;;
+
+        update|refresh)
+            _vpn_sub_ensure
+            local arg="$2" ids id active_id changed=0 failed=0 rc
+            active_id=$(cat "$SUBS_ACTIVE" 2>/dev/null || true)
+            if [ "$arg" = "all" ]; then
+                ids=$(cut -f1 "$SUBS_LIST" 2>/dev/null)
+            elif [ -n "$arg" ]; then
+                id=$(_vpn_sub_id "$arg")
+                [ -n "$id" ] || { echo "[vpn] 找不到订阅: $arg" >&2; return 1; }
+                ids="$id"
+            else
+                [ -n "$active_id" ] || { echo "[vpn] 暂无订阅" >&2; return 1; }
+                ids="$active_id"
+            fi
+            [ -n "$ids" ] || { echo "[vpn] 暂无订阅" >&2; return 1; }
+            for id in $ids; do
+                _vpn_sub_update_one "$id"
+                rc=$?
+                case $rc in
+                    0) [ "$id" = "$active_id" ] && changed=1 ;;
+                    1) failed=1 ;;
+                esac
+            done
+            if [ "$changed" = "1" ] && _vpn_mihomo_running; then
+                echo "[vpn] 当前订阅已更新，重启 Mihomo 生效..."
+                _vpn_sub_restart
+            fi
+            [ "$failed" = "1" ] && return 1
+            ;;
+
+        remove|rm)
+            _vpn_sub_ensure
+            local key="$2" id active_id
+            if [ -z "$key" ]; then
+                echo "用法: vpn sub remove <名称|ID>" >&2
+                return 1
+            fi
+            id=$(_vpn_sub_id "$key")
+            [ -n "$id" ] || { echo "[vpn] 找不到订阅: $key" >&2; return 1; }
+            active_id=$(cat "$SUBS_ACTIVE" 2>/dev/null || true)
+            if [ "$id" = "$active_id" ]; then
+                echo "[vpn] 不能删除当前使用中的订阅，请先 vpn sub use 切换到其他订阅" >&2
+                return 1
+            fi
+            grep -vF "$(printf '%s\t' "$id")" "$SUBS_LIST" > "$SUBS_LIST.tmp" \
+                && mv -f "$SUBS_LIST.tmp" "$SUBS_LIST"
+            rm -f "$SUBS_DIR/$id.yaml" "$SUBS_DIR/$id.raw"
+            echo "[vpn] 已删除订阅: $key"
+            ;;
+
+        auto)
+            _vpn_sub_ensure
+            local arg="${2:-status}"
+            case "$arg" in
+                on|1)
+                    printf '1\n' > "$SUBS_AUTO"
+                    echo "[vpn] 自动更新已开启（间隔 $((SUB_UPDATE_INTERVAL / 3600))h）"
+                    ;;
+                off|0)
+                    printf '0\n' > "$SUBS_AUTO"
+                    echo "[vpn] 自动更新已关闭"
+                    ;;
+                status)
+                    [ "$(cat "$SUBS_AUTO" 2>/dev/null)" = "1" ] && echo "开" || echo "关"
+                    ;;
+                *)
+                    echo "用法: vpn sub auto on|off|status" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+
+        check)
+            _vpn_sub_check
+            ;;
+
+        help|-h|--help)
+            cat <<'EOF'
+vpn sub - 订阅管理命令
+
+子命令:
+  vpn sub list                  列出所有订阅（* 为当前使用）
+  vpn sub add <URL> [名称]      添加订阅（clash yaml / base64 / sub:// / json 均可）
+  vpn sub use <名称|ID>         切换当前订阅（重新生成 config.yaml 并重启）
+  vpn sub update [all|名称|ID]  更新订阅（默认当前订阅；all 更新全部）
+  vpn sub remove <名称|ID>      删除订阅
+  vpn sub auto on|off|status    自动更新开关（vpn on/restart 时自动检查，默认间隔 24h）
+  vpn sub help                  显示本帮助
+
+说明:
+  - 订阅文件保存在 $SUBS_DIR/，config.yaml 由 $BASE_CONFIG 自动生成
+  - 手动调整 dns/rules/端口请编辑 $BASE_CONFIG
+  - 第一次运行时，现有 config.yaml 会被抽离为基础配置 + 默认订阅
+    （原文件备份为 config.yaml.bak-inline）
+EOF
+            ;;
+
+        *)
+            echo "[vpn] 未知子命令: $cmd" >&2
+            echo "  用法: vpn sub list|add|use|update|remove|auto|check|help" >&2
+            return 2
+            ;;
+    esac
+}
+
+# ---- 主入口 ----
+vpn() {
+    local cmd="${1:-status}"
+    case "$cmd" in
+        on|start)
+            vpn_sub check
+            if _vpn_start_mihomo; then
+                _vpn_set_proxy
+                echo "[vpn] 当前终端代理已开启 → http://127.0.0.1:$PROXY_PORT"
+            else
+                return 1
+            fi
+            ;;
+        off|disable)
+            _vpn_unset_proxy
+            echo "[vpn] 当前终端代理已关闭（Mihomo 进程仍在运行，可随时 vpn on 再开）"
+            ;;
+        stop)
+            _vpn_unset_proxy
+            _vpn_stop_mihomo
+            echo "[vpn] 代理与 Mihomo 均已关闭"
+            ;;
+        restart)
+            _vpn_stop_mihomo
+            sleep 1
+            vpn_sub check
+            if _vpn_start_mihomo; then
+                _vpn_set_proxy
+            else
+                return 1
+            fi
+            ;;
+        status)
+            local pid port port_info
+            echo "===== Mihomo 进程 ====="
+            if _vpn_mihomo_running; then
+                pid="$(_vpn_mihomo_pid)"
+                echo "  状态: 运行中"
+                ps -p "$pid" -o pid=,args= | sed 's/^/  /'
+            else
+                echo "  状态: 未运行"
+            fi
+            if [ -x "$MIHOMO_BIN" ]; then
+                "$MIHOMO_BIN" -v 2>&1 | head -n 1 | sed 's/^/  版本: /'
+            fi
+            echo "===== 端口监听 ====="
+            for port in $LISTEN_PORTS; do
+                port_info=$(ss -ltn 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
+                if [ -n "$port_info" ]; then
+                    echo "$port_info" | sed 's/^/  /'
+                fi
+            done
+            echo "===== 当前终端代理 ====="
+            if [ -n "$http_proxy" ]; then
+                echo "  http_proxy  = $http_proxy"
+                echo "  https_proxy = $https_proxy"
+            else
+                echo "  未设置（当前终端不走代理）"
+            fi
+            echo "===== 订阅 ====="
+            if [ -s "$SUBS_ACTIVE" ] 2>/dev/null; then
+                _vpn_sub_ensure
+                local sub_id sub_line sub_name sub_epoch sub_count sub_auto
+                sub_id=$(cat "$SUBS_ACTIVE" 2>/dev/null)
+                sub_line=$(_vpn_sub_entry "$sub_id")
+                sub_name=$(printf '%s\n' "$sub_line" | cut -f2)
+                sub_epoch=$(printf '%s\n' "$sub_line" | cut -f4)
+                sub_count=$(grep -c '^- name:' "$SUBS_DIR/$sub_id.yaml" 2>/dev/null)
+                sub_count=${sub_count:-0}
+                [ "$(cat "$SUBS_AUTO" 2>/dev/null)" = "1" ] && sub_auto=开 || sub_auto=关
+                echo "  当前: $sub_name [$sub_id]  节点: $sub_count"
+                echo "  上次更新: $(date -d "@$sub_epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 未知)  自动更新: $sub_auto"
+                echo "  订阅管理: vpn sub list | vpn sub add <URL> | vpn sub use <名称> | vpn sub update"
+            else
+                echo "  未设置订阅（vpn sub add <订阅URL> [名称]）"
+            fi
+            ;;
+        test)
+            echo "===== 连通性测试 ====="
+            _vpn_test "https://www.google.com"
+            _vpn_test "https://github.com"
+            _vpn_test "https://www.baidu.com"
+            ;;
+        log)
+            tail -n "${2:-30}" "$MIHOMO_LOG"
+            ;;
+        sub|subscription)
+            shift
+            vpn_sub "$@"
+            ;;
+        help|-h|--help)
+            cat <<'EOF'
+vpn - Mihomo 代理控制命令
+
+子命令:
+  vpn on        启动 Mihomo + 开启当前终端代理
+  vpn off       关闭当前终端代理（保留 Mihomo 进程）
+  vpn stop      停止 Mihomo 进程 + 关闭代理
+  vpn restart   重启 Mihomo 进程
+  vpn status    查看状态（进程/端口/代理/订阅）
+  vpn test      测试连通性（Google/GitHub/Baidu）
+  vpn log [N]   查看最近 N 行日志（默认 30）
+  vpn sub       订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
+  vpn help      显示本帮助
+
+注意:
+  - "vpn on/off" 仅影响当前终端；新开终端需再次执行 vpn on
+  - 如需永久开启，把 vpn on 加入 ~/.bashrc 末尾即可
+  - 手动调整 dns/rules/端口请编辑 config.base.yaml（由订阅功能自动生成 config.yaml）
+EOF
+            ;;
+        *)
+            echo "[vpn] 未知子命令: $cmd" >&2
+            echo "  用法: vpn on|off|stop|status|restart|test|log|sub|help" >&2
+            return 2
+            ;;
+    esac
+}
+
+# ---- 兼容旧命令名 ----
+unvpn() {
+    vpn off
+}
+
+# 加载提示（仅在新开 shell 时显示一次，可注释掉）
+# echo "[vpn.sh] 已加载，输入 'vpn help' 查看用法"

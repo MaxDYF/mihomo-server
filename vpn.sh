@@ -210,7 +210,7 @@ if cmd == 'extract':
     if not cleaned:
         sys.exit('empty proxy list')
     with open(out, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(cleaned, f, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump({'proxies': cleaned}, f, allow_unicode=True, sort_keys=False)
     print(len(cleaned))
 
 elif cmd == 'migrate':
@@ -223,7 +223,7 @@ elif cmd == 'migrate':
     with open(base_out, 'w', encoding='utf-8') as f:
         yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False)
     with open(prov_out, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(proxies, f, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump({'proxies': proxies}, f, allow_unicode=True, sort_keys=False)
     print(len(proxies))
 
 elif cmd == 'minimal':
@@ -256,7 +256,7 @@ elif cmd == 'gen':
             },
         }
     }
-    base['proxy-groups'] = [
+    groups = [
         {'name': '🚀节点选择', 'type': 'select',
          'proxies': ['♻️自动选择', 'DIRECT'], 'use': [pid]},
         {'name': '♻️自动选择', 'type': 'url-test',
@@ -266,6 +266,27 @@ elif cmd == 'gen':
         {'name': '🛑广告拦截', 'type': 'select',
          'proxies': ['REJECT', 'DIRECT']},
     ]
+    # 扫描 rules 中被引用但未定义的策略组，自动补一个 select 组，
+    # 避免因旧配置残留的组名导致 mihomo 解析失败
+    BUILTIN = {'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL'}
+    OPTIONS = {'no-resolve', 'force-remote-dns', 'force-ipv6', 'force-ipv4', 'ip-asn', 'resolve'}
+    known = {g['name'] for g in groups}
+    extra = set()
+    for r in (base.get('rules') or []):
+        if not isinstance(r, str):
+            continue
+        parts = r.split(',')
+        if len(parts) < 3:
+            continue
+        t = parts[-1].strip()
+        if t in OPTIONS and len(parts) >= 4:
+            t = parts[-2].strip()
+        if not t or t in BUILTIN or t in known or t in OPTIONS:
+            continue
+        extra.add(t)
+    for t in sorted(extra):
+        groups.append({'name': t, 'type': 'select', 'use': [pid]})
+    base['proxy-groups'] = groups
     with open(out, 'w', encoding='utf-8') as f:
         yaml.safe_dump(base, f, allow_unicode=True, sort_keys=False)
     print('ok')
@@ -478,9 +499,14 @@ vpn_sub() {
                 printf '%s\n' "$id" > "$SUBS_ACTIVE"
                 if _vpn_sub_gen_config "$id"; then
                     echo "[vpn] 已设为当前订阅"
-                    _vpn_mihomo_running && _vpn_sub_restart
+                    if _vpn_mihomo_running; then
+                        _vpn_sub_restart
+                    else
+                        echo "[vpn] Mihomo 未在运行，执行 vpn on 即可生效"
+                    fi
                 fi
             fi
+            return 0
             ;;
 
         use|switch|select)
@@ -499,7 +525,12 @@ vpn_sub() {
             if ! _vpn_sub_gen_config "$id"; then return 1; fi
             name=$(awk -F '\t' -v id="$id" '$1==id {print $2}' "$SUBS_LIST")
             echo "[vpn] 已切换到订阅「$name」（$id）"
-            _vpn_mihomo_running && _vpn_sub_restart
+            if _vpn_mihomo_running; then
+                _vpn_sub_restart
+            else
+                echo "[vpn] Mihomo 未在运行，执行 vpn on 即可生效"
+            fi
+            return 0
             ;;
 
         update|refresh)

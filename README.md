@@ -21,6 +21,8 @@ No GUI required. Only depends on `curl`, `python3`, and the `mihomo` binary.
 - **Multiple subscriptions**: keep several airport/provider subscriptions and switch with `vpn sub use`
 - **Subscription format support**: Clash YAML / plain proxy lists / base64 subscriptions / `sub://` links / JSON
 - **Auto-update**: with `vpn sub auto on`, `vpn on` / `vpn restart` automatically check for stale subscriptions (default 24h) and refresh silently
+- **Node switching**: `vpn node use` switches the active node instantly via the control API (no restart)
+- **Global mode**: `vpn global on` routes all traffic through the selected node
 - **Generated config**: `config.yaml` is generated from `config.base.yaml` plus the active subscription's proxy-providers; manual settings like dns/rules/ports are preserved
 - **Smooth migration**: on first run, an existing `config.yaml` is split into a base config + a default subscription (original backed up as `config.yaml.bak-inline`)
 - **Safe process control**: PID-file based management avoids killing unrelated processes
@@ -129,6 +131,10 @@ vpn status                    # process / port / subscription status
 | `vpn sub update [all\|name\|ID]` | Update subscription(s) |
 | `vpn sub remove <name\|ID>` | Remove a subscription |
 | `vpn sub auto on\|off` | Toggle auto-update |
+| `vpn node list` | List nodes of the current subscription (`*` marks the active one) |
+| `vpn node use <name\|number>` | Switch the active node instantly (no restart) |
+| `vpn node auto` | Switch back to auto-select (latency-based) |
+| `vpn global on\|off` | Enable/disable global mode (all traffic through the selected node) |
 
 ## Directory Layout
 

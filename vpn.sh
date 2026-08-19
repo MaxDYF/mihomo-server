@@ -40,6 +40,10 @@ SUB_DOWNLOAD_TIMEOUT="${SUB_DOWNLOAD_TIMEOUT:-30}"
 SUB_UA="${SUB_UA:-clash-verge/v2.0.0}"
 SUB_HEALTH_URL="${SUB_HEALTH_URL:-http://cp.cloudflare.com/generate_204}"
 
+# ---- 控制 API（节点切换/全局模式）----
+CONTROL_PORT="${CONTROL_PORT:-9090}"
+CONTROL_SECRET_FILE="${CONTROL_SECRET_FILE:-$SUBS_DIR/controller.secret}"
+
 # ---- 内部辅助 ----
 _vpn_mihomo_pid() {
     local pid
@@ -256,6 +260,11 @@ elif cmd == 'gen':
             },
         }
     }
+    base['external-controller'] = '127.0.0.1:%s' % (sys.argv[7] if len(sys.argv) > 7 else '9090')
+    if len(sys.argv) > 8 and sys.argv[8]:
+        base['secret'] = sys.argv[8]
+    if len(sys.argv) > 9 and sys.argv[9]:
+        base['mode'] = sys.argv[9]
     groups = [
         {'name': '🚀节点选择', 'type': 'select',
          'proxies': ['♻️自动选择', 'DIRECT'], 'use': [pid]},
@@ -290,6 +299,29 @@ elif cmd == 'gen':
     with open(out, 'w', encoding='utf-8') as f:
         yaml.safe_dump(base, f, allow_unicode=True, sort_keys=False)
     print('ok')
+
+elif cmd == 'api':
+    # 控制 API 封装：api <METHOD> <PATH> [JSON_BODY] <PORT> <SECRET>
+    import urllib.request, urllib.parse
+    method, path = sys.argv[2], sys.argv[3]
+    body = sys.argv[4] if len(sys.argv) > 4 else None
+    port = sys.argv[5] if len(sys.argv) > 5 else '9090'
+    secret = sys.argv[6] if len(sys.argv) > 6 else ''
+    url = 'http://127.0.0.1:%s%s' % (port, urllib.parse.quote(path, safe='/'))
+    req = urllib.request.Request(url, method=method)
+    req.add_header('Authorization', 'Bearer ' + secret)
+    if body is not None:
+        req.add_header('Content-Type', 'application/json')
+        req.data = body.encode('utf-8')
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            out = r.read().decode('utf-8', errors='replace')
+            if out:
+                print(out)
+            sys.exit(0 if r.status < 400 else 1)
+    except Exception as e:
+        sys.stderr.write('API 请求失败: %s\n' % e)
+        sys.exit(1)
 PYEOF
 }
 
@@ -368,14 +400,77 @@ _vpn_sub_ensure() {
 }
 
 _vpn_sub_gen_config() {
-    local id="$1"
+    local id="$1" mode
     [ -f "$BASE_CONFIG" ] || { echo "[vpn] 错误：缺少基础配置 $BASE_CONFIG" >&2; return 1; }
     [ -f "$SUBS_DIR/$id.yaml" ] || { echo "[vpn] 错误：缺少订阅文件 $SUBS_DIR/$id.yaml" >&2; return 1; }
-    _vpn_sub_py gen "$BASE_CONFIG" "$CONFIG_FILE" "$id" "subs/$id.yaml" "$SUB_HEALTH_URL" >/dev/null || {
+    mode=$(_vpn_current_mode)
+    _vpn_sub_py gen "$BASE_CONFIG" "$CONFIG_FILE" "$id" "subs/$id.yaml" "$SUB_HEALTH_URL" \
+        "$CONTROL_PORT" "$(_vpn_control_secret)" "$mode" >/dev/null || {
         echo "[vpn] 生成 $CONFIG_FILE 失败" >&2
         return 1
     }
     return 0
+}
+
+_vpn_control_secret() {
+    local f="$CONTROL_SECRET_FILE"
+    if [ ! -s "$f" ] 2>/dev/null; then
+        mkdir -p "$SUBS_DIR"
+        od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$f"
+        chmod 600 "$f"
+    fi
+    cat "$f"
+}
+
+_vpn_api() {
+    # _vpn_api <METHOD> <PATH> [JSON_BODY]
+    local out rc
+    out=$(_vpn_sub_py api "$1" "$2" "${3-}" "$CONTROL_PORT" "$(_vpn_control_secret)")
+    rc=$?
+    if [ "$rc" != "0" ]; then
+        echo "[vpn] API 请求失败（请确认已 vpn on，且控制端口 $CONTROL_PORT 可用）" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+}
+
+_vpn_current_mode() {
+    cat "$SUBS_DIR/mode" 2>/dev/null || true
+}
+
+_vpn_current_group() {
+    # 节点操作统一作用于 🚀节点选择；全局模式下 GLOBAL 组指向它
+    printf '🚀节点选择\n'
+}
+
+_vpn_post_start() {
+    # 启动完成后：全局模式下确保 GLOBAL 组指向 🚀节点选择（所有流量跟随所选节点）
+    [ "$(_vpn_current_mode)" = "global" ] || return 0
+    local i
+    for i in 1 2 3 4 5; do
+        if _vpn_api PUT "/proxies/GLOBAL" '{"name":"🚀节点选择"}' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "[vpn] 警告：无法设置 GLOBAL 组指向 🚀节点选择，请检查控制 API" >&2
+    return 1
+}
+
+_vpn_sub_regen_restart() {
+    # 重新生成 config.yaml（当前订阅 + 模式）并按需重启
+    local id
+    id=$(cat "$SUBS_ACTIVE" 2>/dev/null || true)
+    if [ -z "$id" ]; then
+        echo "[vpn] 暂无订阅，请先 vpn sub add" >&2
+        return 1
+    fi
+    _vpn_sub_gen_config "$id" || return 1
+    if _vpn_mihomo_running; then
+        _vpn_sub_restart
+    else
+        echo "[vpn] 已重新生成配置，执行 vpn on 生效"
+    fi
 }
 
 _vpn_sub_update_one() {
@@ -638,6 +733,105 @@ EOF
     esac
 }
 
+# ---- 节点切换 / 全局模式 ----
+_vpn_node_filter() {
+    # 过滤策略组与特殊名称，只留真实节点（含 DIRECT），输出带序号
+    python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+skip = {"♻️自动选择", "🐟漏网之鱼", "🛑广告拦截", "🎬媒体解锁", "🤖AI网站",
+        "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", "default"}
+now = d.get("now", "")
+i = 0
+for n in d.get("all", []):
+    if n in skip:
+        continue
+    i += 1
+    mark = "*" if n == now else " "
+    print("%s %3d. %s" % (mark, i, n))
+'
+}
+
+_vpn_node_pick() {
+    # 解析名称或序号 -> 节点名；输出到 stdout
+    local key="$1"
+    printf '%s' "$key" | grep -Eq '^[0-9]+$' || {
+        printf '%s\n' "$key"
+        return 0
+    }
+    python3 -c '
+import json, sys
+key = int(sys.argv[1])
+skip = {"♻️自动选择", "🐟漏网之鱼", "🛑广告拦截", "🎬媒体解锁", "🤖AI网站",
+        "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", "default"}
+items = [n for n in json.load(sys.stdin).get("all", []) if n not in skip]
+if 1 <= key <= len(items):
+    print(items[key - 1])
+else:
+    sys.exit(1)
+' "$key"
+}
+
+vpn_node() {
+    local cmd="${1:-list}" group data target now
+    group=$(_vpn_current_group)
+    case "$cmd" in
+        list|ls)
+            data=$(_vpn_api GET "/proxies/$group") || return 1
+            echo "===== 节点列表（$group 组）====="
+            printf '%s' "$data" | _vpn_node_filter
+            ;;
+        use|select|switch)
+            local key="$2"
+            if [ -z "$key" ]; then
+                echo "用法: vpn node use <节点名称|序号>" >&2
+                return 1
+            fi
+            data=$(_vpn_api GET "/proxies/$group") || return 1
+            target=$(printf '%s' "$data" | _vpn_node_pick "$key") || {
+                echo "[vpn] 找不到节点: $key" >&2
+                return 1
+            }
+            _vpn_api PUT "/proxies/$group" \
+                "$(python3 -c "import json,sys; print(json.dumps({'name': sys.argv[1]}))" "$target")" >/dev/null || return 1
+            echo "[vpn] 已切换: $group → $target"
+            ;;
+        auto)
+            _vpn_api PUT "/proxies/🚀节点选择" '{"name":"♻️自动选择"}' >/dev/null || return 1
+            echo "[vpn] 已切换: 🚀节点选择 → ♻️自动选择（自动测速选优）"
+            ;;
+        show|status)
+            data=$(_vpn_api GET "/proxies/$group") || return 1
+            now=$(printf '%s' "$data" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("now",""))')
+            if [ "$(_vpn_current_mode)" = "global" ]; then
+                echo "全局模式: GLOBAL → 🚀节点选择 → $now（所有流量走该节点）"
+            else
+                echo "规则模式: 🚀节点选择 → $now"
+            fi
+            ;;
+        help|-h|--help)
+            cat <<'EOF'
+vpn node - 节点切换命令
+
+子命令:
+  vpn node list             列出当前组的全部节点（* 为当前选中）
+  vpn node use <名称|序号>  切换节点（序号见 list 输出）
+  vpn node auto             切回自动选择（url-test 测速选优）
+  vpn node show             查看当前选中的节点
+
+说明:
+  - 规则模式下切换的是「🚀节点选择」组
+  - 全局模式（vpn global on）下切换的是「GLOBAL」组，所有流量走选中节点
+EOF
+            ;;
+        *)
+            echo "[vpn] 未知子命令: $cmd" >&2
+            echo "  用法: vpn node list|use|auto|show|help" >&2
+            return 2
+            ;;
+    esac
+}
+
 # ---- 主入口 ----
 vpn() {
     local cmd="${1:-status}"
@@ -646,6 +840,7 @@ vpn() {
             vpn_sub check
             if _vpn_start_mihomo; then
                 _vpn_set_proxy
+                _vpn_post_start
                 echo "[vpn] 当前终端代理已开启 → http://127.0.0.1:$PROXY_PORT"
             else
                 return 1
@@ -666,6 +861,7 @@ vpn() {
             vpn_sub check
             if _vpn_start_mihomo; then
                 _vpn_set_proxy
+                _vpn_post_start
             else
                 return 1
             fi
@@ -714,6 +910,20 @@ vpn() {
             else
                 echo "  未设置订阅（vpn sub add <订阅URL> [名称]）"
             fi
+            echo "===== 模式与节点 ====="
+            if _vpn_mihomo_running; then
+                local node_mode node_group node_now node_data
+                node_mode=$(_vpn_current_mode)
+                [ -z "$node_mode" ] && node_mode=$(python3 -c "import yaml; print(yaml.safe_load(open('$BASE_CONFIG')).get('mode','rule'))" 2>/dev/null || echo rule)
+                node_group=$(_vpn_current_group)
+                node_data=$(_vpn_api GET "/proxies/$node_group" 2>/dev/null) && {
+                    node_now=$(printf '%s' "$node_data" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("now",""))')
+                    echo "  模式: $node_mode  当前节点: $node_now"
+                    echo "  切换: vpn node list | vpn node use <名称> | vpn node auto"
+                } || echo "  模式: $node_mode（控制器未就绪，重启后可用 vpn node）"
+            else
+                echo "  Mihomo 未运行（vpn on 启动后可用 vpn node）"
+            fi
             ;;
         test)
             echo "===== 连通性测试 ====="
@@ -728,6 +938,36 @@ vpn() {
             shift
             vpn_sub "$@"
             ;;
+        node)
+            shift
+            vpn_node "$@"
+            ;;
+        global|mode)
+            local arg="${2:-status}"
+            case "$arg" in
+                on|global)
+                    printf 'global\n' > "$SUBS_DIR/mode"
+                    echo "[vpn] 已开启全局模式：所有流量走选中的节点（vpn node use 选择）"
+                    _vpn_sub_regen_restart
+                    ;;
+                off|rule)
+                    printf 'rule\n' > "$SUBS_DIR/mode"
+                    echo "[vpn] 已关闭全局模式：按规则分流（vpn node use 选择 🚀节点选择）"
+                    _vpn_sub_regen_restart
+                    ;;
+                status)
+                    local mode base_mode
+                    mode=$(_vpn_current_mode)
+                    base_mode=$(python3 -c "import yaml; print(yaml.safe_load(open('$BASE_CONFIG'))['mode'])" 2>/dev/null)
+                    [ -z "$mode" ] && mode="$base_mode"
+                    echo "[vpn] 当前模式: $mode${base_mode:+（base 默认 $base_mode）}"
+                    ;;
+                *)
+                    echo "用法: vpn global on|off|status" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
         help|-h|--help)
             cat <<'EOF'
 vpn - Mihomo 代理控制命令
@@ -741,6 +981,8 @@ vpn - Mihomo 代理控制命令
   vpn test      测试连通性（Google/GitHub/Baidu）
   vpn log [N]   查看最近 N 行日志（默认 30）
   vpn sub       订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
+  vpn node      节点切换：list/use/auto/show（规则模式选 🚀节点选择）
+  vpn global    全局模式 on|off|status（所有流量走选中的节点）
   vpn help      显示本帮助
 
 注意:
@@ -751,7 +993,7 @@ EOF
             ;;
         *)
             echo "[vpn] 未知子命令: $cmd" >&2
-            echo "  用法: vpn on|off|stop|status|restart|test|log|sub|help" >&2
+            echo "  用法: vpn on|off|stop|status|restart|test|log|sub|node|global|help" >&2
             return 2
             ;;
     esac

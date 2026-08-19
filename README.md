@@ -49,17 +49,17 @@ sudo dnf install -y curl python3 python3-pyyaml iproute
 
 ### 2. Install the Mihomo core
 
-Download the latest `linux-amd64` asset from the [Mihomo releases page](https://github.com/MetaCubeX/mihomo/releases/latest) (e.g. `mihomo-linux-amd64-v1.19.11.gz`):
+Use the bundled download script (auto-detects your architecture and fetches the latest release from the [Mihomo releases page](https://github.com/MetaCubeX/mihomo/releases/latest)):
 
 ```bash
 mkdir -p ~/clash && cd ~/clash
-curl -Lo mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.19.11/mihomo-linux-amd64-v1.19.11.gz
-gunzip -f mihomo.gz
-chmod +x mihomo
-./mihomo -v    # verify
+./install-mihomo.sh          # installs to $HOME/clash/mihomo by default
+./mihomo -v                  # verify
 ```
 
-> Alternatively, install mihomo from your distro's package manager or mirror the binary into `~/clash/`.
+Options: `--dir <path>` to change the install directory, `--version v1.19.30` to pin a specific release.
+
+> Alternatively, install mihomo from your distro's package manager or mirror the binary into `~/clash/` manually.
 
 ### 3. Clone the repository
 
@@ -134,14 +134,15 @@ vpn status                    # process / port / subscription status
 
 ```
 clash/
-├── vpn.sh            # main script (loaded via source)
-├── config.base.yaml  # base config template (edit dns/rules/ports here)
-├── config.yaml       # auto-generated (base + active subscription)
-├── subs/             # subscription files and registry
-│   ├── subs.list     # subscription registry (id/name/URL/update time)
-│   ├── subs.active   # currently active subscription
-│   └── subs.auto     # auto-update toggle
-└── mihomo            # core binary
+├── vpn.sh              # main script (loaded via source)
+├── install-mihomo.sh   # mihomo core downloader (latest release)
+├── config.base.yaml    # base config template (edit dns/rules/ports here)
+├── config.yaml         # auto-generated (base + active subscription)
+├── subs/               # subscription files and registry
+│   ├── subs.list       # subscription registry (id/name/URL/update time)
+│   ├── subs.active     # currently active subscription
+│   └── subs.auto       # auto-update toggle
+└── mihomo              # core binary (downloaded, not tracked)
 ```
 
 Files marked with `.gitignore` (`config.yaml`, `config.base.yaml`, `subs/`, logs, the `mihomo` binary, etc.) are local runtime/user data and are not tracked in the repository.

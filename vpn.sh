@@ -50,7 +50,13 @@ _vpn_conf_get() {
 }
 
 # 用户显式设置的端口值（环境变量或 ports.conf）；为空表示未显式指定，
-# 生成配置时将保留 config.base.yaml 中原有的端口设置
+# 生成配置时将保留 config.base.yaml 中原有的端口设置。
+# 同时记录哪些键来自环境变量（优先级高于 ports.conf）
+_VPN_ENV_PROXY=0;   [ -n "${PROXY_PORT:-}" ]   && _VPN_ENV_PROXY=1
+_VPN_ENV_SOCKS=0;   [ -n "${SOCKS_PORT:-}" ]   && _VPN_ENV_SOCKS=1
+_VPN_ENV_HTTP=0;    [ -n "${HTTP_PORT:-}" ]    && _VPN_ENV_HTTP=1
+_VPN_ENV_CONTROL=0; [ -n "${CONTROL_PORT:-}" ] && _VPN_ENV_CONTROL=1
+
 VPN_PROXY_PORT_SET="${PROXY_PORT:-$(_vpn_conf_get PROXY_PORT)}"
 VPN_SOCKS_PORT_SET="${SOCKS_PORT:-$(_vpn_conf_get SOCKS_PORT)}"
 VPN_HTTP_PORT_SET="${HTTP_PORT:-$(_vpn_conf_get HTTP_PORT)}"
@@ -168,6 +174,20 @@ _vpn_start_mihomo() {
         return 1
     fi
 
+    # 无配置时拒绝启动：否则 mihomo 会以内置默认端口(7890/9090)裸跑，
+    # 在共享服务器上必然绑定失败或与他人冲突
+    if [ ! -s "$CONFIG_FILE" ]; then
+        echo "[vpn] 错误：缺少配置文件 $CONFIG_FILE，拒绝启动" >&2
+        local aid
+        aid="$(cat "$SUBS_ACTIVE" 2>/dev/null || true)"
+        if [ -z "$aid" ] || [ ! -f "$SUBS_DIR/$aid.yaml" ]; then
+            echo "[vpn] 请先添加订阅: vpn sub add <订阅URL> [名称]" >&2
+        else
+            echo "[vpn] 订阅已存在但配置生成失败，请重试: vpn sub use \"$aid\"" >&2
+        fi
+        return 1
+    fi
+
     nohup "$MIHOMO_BIN" -d "$MIHOMO_DIR" >> "$MIHOMO_LOG" 2>&1 &
     pid=$!
     printf '%s\n' "$pid" > "$MIHOMO_PIDFILE"
@@ -242,6 +262,22 @@ _vpn_test() {
 }
 
 # ---- 订阅管理 ----
+
+_vpn_config_fingerprint() {
+    # 计算 config.yaml 的内容指纹（基础配置/订阅/模式/端口任一变化都会改变指纹）
+    local aid
+    aid="$(cat "$SUBS_ACTIVE" 2>/dev/null || true)"
+    {
+        printf 'control=%s\n' "$CONTROL_PORT"
+        printf 'mixed=%s socks=%s http=%s\n' \
+            "${VPN_PROXY_PORT_SET:-}" "${VPN_SOCKS_PORT_SET:-}" "${VPN_HTTP_PORT_SET:-}"
+        printf 'mode=%s\n' "$(_vpn_current_mode)"
+        printf 'sub=%s\n' "$aid"
+        [ -f "$BASE_CONFIG" ] && cksum < "$BASE_CONFIG"
+        [ -n "$aid" ] && [ -f "$SUBS_DIR/$aid.yaml" ] && cksum < "$SUBS_DIR/$aid.yaml"
+        [ -f "$CONTROL_SECRET_FILE" ] && cksum < "$CONTROL_SECRET_FILE"
+    } 2>/dev/null | cksum | awk '{print $1}'
+}
 
 _vpn_sub_entry() {
     awk -F '\t' -v k="$1" '$1==k || $2==k {print; exit}' "$SUBS_LIST" 2>/dev/null
@@ -527,9 +563,15 @@ _vpn_sub_ensure() {
             && echo "[vpn] 已生成最小基础配置 $BASE_CONFIG"
     fi
 
-    # config.yaml 缺失时按当前订阅重新生成
-    if [ ! -f "$CONFIG_FILE" ] && [ -s "$SUBS_ACTIVE" ] 2>/dev/null; then
-        _vpn_sub_gen_config "$(cat "$SUBS_ACTIVE")"
+    # config.yaml 缺失或输入（base/订阅/模式/端口）发生变化时重新生成
+    if [ -s "$SUBS_ACTIVE" ] 2>/dev/null; then
+        local fp fpfile="$SUBS_DIR/config.fp"
+        fp="$(_vpn_config_fingerprint)"
+        if [ ! -s "$CONFIG_FILE" ] || [ "$(cat "$fpfile" 2>/dev/null)" != "$fp" ]; then
+            if _vpn_sub_gen_config "$(cat "$SUBS_ACTIVE")"; then
+                printf '%s\n' "$fp" > "$fpfile"
+            fi
+        fi
     fi
 }
 
@@ -1072,8 +1114,186 @@ EOF
     esac
 }
 
+# ---- 端口设置命令 ----
+_vpn_ports_sync() {
+    # 每次命令执行前从 ports.conf 刷新端口变量，
+    # 修复「vpn port set 经管道调用时变量更新留在子 shell」导致的过期端口问题；
+    # 环境变量显式指定的键不覆盖（保持 环境变量 > ports.conf > 默认 的优先级）
+    local v
+    if [ "$_VPN_ENV_PROXY" = 0 ]; then
+        VPN_PROXY_PORT_SET=$(_vpn_conf_get PROXY_PORT)
+        PROXY_PORT="${VPN_PROXY_PORT_SET:-7890}"
+    fi
+    if [ "$_VPN_ENV_SOCKS" = 0 ]; then
+        VPN_SOCKS_PORT_SET=$(_vpn_conf_get SOCKS_PORT)
+        SOCKS_PORT="${VPN_SOCKS_PORT_SET:-7891}"
+    fi
+    if [ "$_VPN_ENV_HTTP" = 0 ]; then
+        VPN_HTTP_PORT_SET=$(_vpn_conf_get HTTP_PORT)
+        HTTP_PORT="${VPN_HTTP_PORT_SET:-7892}"
+    fi
+    if [ "$_VPN_ENV_CONTROL" = 0 ]; then
+        CONTROL_PORT=$(_vpn_conf_get CONTROL_PORT)
+        [ -n "$CONTROL_PORT" ] || CONTROL_PORT=9090
+    fi
+    LISTEN_PORTS="${PROXY_PORT} ${SOCKS_PORT} ${HTTP_PORT}"
+}
+
+_vpn_port_valid() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+_vpn_port_usable() {
+    # 非 root 用户不能绑定 <1024 的特权端口
+    if [ "$1" -lt 1024 ] 2>/dev/null && [ "$(id -u)" != 0 ]; then
+        echo "[vpn] 错误：端口 $1 为特权端口（<1024），普通用户无法绑定，请使用 1024 以上端口" >&2
+        return 1
+    fi
+    return 0
+}
+
+_vpn_conf_set() {
+    # 写入/更新 ports.conf 中的 KEY=VALUE（文件不存在则创建）
+    local key="$1" val="$2"
+    touch "$PORTS_CONF" || return 1
+    if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "$PORTS_CONF" 2>/dev/null; then
+        sed -i "s|^[[:space:]]*${key}[[:space:]]*=.*|${key}=${val}|" "$PORTS_CONF"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$PORTS_CONF"
+    fi
+}
+
+_vpn_conf_unset() {
+    # 从 ports.conf 删除指定键（文件不存在则忽略）
+    [ -f "$PORTS_CONF" ] && sed -i "/^[[:space:]]*${1}[[:space:]]*=/d" "$PORTS_CONF"
+    return 0
+}
+
+_vpn_port_show_one() {
+    # 显示单个端口项: _vpn_port_show_one <显示名> <变量名>
+    local label="$1" var="$2" src
+    if grep -Eq "^[[:space:]]*${2}[[:space:]]*=" "$PORTS_CONF" 2>/dev/null; then
+        src="ports.conf"
+    else
+        src="默认值"
+    fi
+    printf '  %-16s :%-6s (%s)\n' "$label" "${!var}" "$src"
+}
+
+vpn_port_apply() {
+    # 把 ports.conf 应用到当前 shell：重算端口变量 → 按需重新生成配置并重启
+    VPN_PROXY_PORT_SET=$(_vpn_conf_get PROXY_PORT)
+    VPN_SOCKS_PORT_SET=$(_vpn_conf_get SOCKS_PORT)
+    VPN_HTTP_PORT_SET=$(_vpn_conf_get HTTP_PORT)
+    CONTROL_PORT=$(_vpn_conf_get CONTROL_PORT)
+    [ -n "$CONTROL_PORT" ] || CONTROL_PORT=9090
+
+    PROXY_PORT="${VPN_PROXY_PORT_SET:-7890}"
+    SOCKS_PORT="${VPN_SOCKS_PORT_SET:-7891}"
+    HTTP_PORT="${VPN_HTTP_PORT_SET:-7892}"
+    LISTEN_PORTS="${PROXY_PORT} ${SOCKS_PORT} ${HTTP_PORT}"
+
+    if _vpn_mihomo_running; then
+        echo "[vpn] 正在以新端口重启 Mihomo..."
+        vpn restart >/dev/null 2>&1 || { echo "[vpn] 重启失败，请查看 vpn log" >&2; return 1; }
+        echo "[vpn] 新端口已生效: mixed=:${PROXY_PORT} socks=:${SOCKS_PORT} http=:${HTTP_PORT} 控制API=:${CONTROL_PORT}"
+    else
+        echo "[vpn] 已保存到 $PORTS_CONF，执行 vpn on 后生效"
+    fi
+}
+
+vpn_port() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        ""|show|status|list|ls)
+            echo "===== 端口设置 ====="
+            _vpn_port_show_one "mixed(代理)" PROXY_PORT
+            _vpn_port_show_one "socks5" SOCKS_PORT
+            _vpn_port_show_one "http" HTTP_PORT
+            _vpn_port_show_one "控制API" CONTROL_PORT
+            echo "  修改: vpn port set <mixed> [socks] [http] [control]"
+            echo "  恢复默认: vpn port reset"
+            ;;
+        set)
+            shift
+            local proxy="${1:-}" socks="${2:-}" http="${3:-}" control="${4:-}" n
+            for n in "$proxy" "$socks" "$http" "$control"; do
+                [ -n "$n" ] || continue
+                _vpn_port_valid "$n" || {
+                    echo "[vpn] 错误：'$n' 不是有效端口号（1-65535）" >&2
+                    return 1
+                }
+                _vpn_port_usable "$n" || return 1
+            done
+            # 查重（显式给出的端口之间不允许重复）
+            local all="$proxy $socks $http $control" dup
+            for dup in $all; do
+                [ -z "$dup" ] && continue
+                if [ "$(printf '%s\n' $all | grep -cx -- "$dup")" -gt 1 ]; then
+                    echo "[vpn] 错误：端口 $dup 被重复指定，请使用不同端口" >&2
+                    return 1
+                fi
+            done
+
+            mkdir -p "$(dirname "$PORTS_CONF")"
+            [ -n "$proxy" ] && _vpn_conf_set PROXY_PORT "$proxy"
+            [ -n "$socks" ] && _vpn_conf_set SOCKS_PORT "$socks"
+            [ -n "$http" ] && _vpn_conf_set HTTP_PORT "$http"
+            [ -n "$control" ] && _vpn_conf_set CONTROL_PORT "$control"
+            echo "[vpn] 端口已写入 $PORTS_CONF"
+            vpn_port_apply
+            ;;
+        reset|unset|clear)
+            _vpn_conf_unset PROXY_PORT
+            _vpn_conf_unset SOCKS_PORT
+            _vpn_conf_unset HTTP_PORT
+            _vpn_conf_unset CONTROL_PORT
+            echo "[vpn] 已清除自定义端口，恢复默认值"
+            vpn_port_apply
+            ;;
+        help|-h|--help)
+            cat <<'EOF'
+vpn port - 端口设置命令
+
+子命令:
+  vpn port                                  查看当前端口及来源
+  vpn port set <mixed> [socks] [http] [control]
+                                            设置端口并写入 ports.conf（运行中自动重启生效）
+                                              mixed   = HTTP+SOCKS 混合代理端口（必需）
+                                              socks   = 独立 SOCKS5 端口（可选）
+                                              http    = 独立 HTTP 端口（可选）
+                                              control = 控制 API 端口（可选）
+  vpn port reset                            清除自定义端口，恢复默认 (7890/7891/7892/9090)
+
+示例:
+  vpn port set 27890                        # 共享服务器最简改法：只换混合代理端口
+  vpn port set 27890 27891 27892 29090      # 全套自定义
+EOF
+            ;;
+        *)
+            # 允许直接跟数字：vpn port <mixed> [socks] [http] [control]
+            local a
+            for a in "$@"; do
+                _vpn_port_valid "${a:-x}" || {
+                    echo "[vpn] 未知子命令: $cmd（vpn port help 查看用法）" >&2
+                    return 2
+                }
+            done
+            [ $# -gt 0 ] || {
+                echo "[vpn] 未知子命令: $cmd（vpn port help 查看用法）" >&2
+                return 2
+            }
+            vpn_port set "$@"
+            ;;
+    esac
+}
+
 # ---- 主入口 ----
 vpn() {
+    _vpn_ports_sync
     local cmd="${1:-status}"
     case "$cmd" in
         on|start)
@@ -1183,6 +1403,10 @@ vpn() {
             shift
             vpn_node "$@"
             ;;
+        port)
+            shift
+            vpn_port "$@"
+            ;;
         global|mode)
             local arg="${2:-status}"
             case "$arg" in
@@ -1223,6 +1447,7 @@ vpn - Mihomo 代理控制命令
   vpn log [N]   查看最近 N 行日志（默认 30）
   vpn sub       订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
   vpn node      节点切换：list/use/auto/show（规则模式选 🚀节点选择）
+  vpn port      端口设置：show/set/reset（写入 ports.conf，运行中自动重启生效）
   vpn global    全局模式 on|off|status（所有流量走选中的节点）
   vpn help      显示本帮助
 
@@ -1230,7 +1455,7 @@ vpn - Mihomo 代理控制命令
   - "vpn on/off" 仅影响当前终端；新开终端需再次执行 vpn on
   - 如需永久开启，把 vpn on 加入 ~/.bashrc 末尾即可
   - 端口设置（优先级：环境变量 > $MIHOMO_DIR/ports.conf > 默认值）：
-      PROXY_PORT=7890 SOCKS_PORT=7891 HTTP_PORT=7892 CONTROL_PORT=9090
+      命令行方式: vpn port set <mixed> [socks] [http] [control]
     每次启动前会检测端口占用，被其他进程占用时会报错并提示处理方法；
     共享服务器上请为 ports.conf 配置一套专属端口，避免与他人冲突
   - 手动调整 dns/rules/端口请编辑 config.base.yaml（由订阅功能自动生成 config.yaml）

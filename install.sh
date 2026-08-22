@@ -100,13 +100,8 @@ cat <<EOF
 [install] 安装完成！接下来：
 
   1. 执行:  source ~/.bashrc      # 或新开一个终端
-  2. 共享服务器建议先配置专属端口（避免与他人冲突）:
-       cat > $DATA_DIR/ports.conf <<'CONF'
-PROXY_PORT=27890
-SOCKS_PORT=27891
-HTTP_PORT=27892
-CONTROL_PORT=29090
-CONF
+  2. 共享服务器建议先设置专属端口（避免与他人冲突）:
+       vpn port set 27890 27891 27892 29090
   3. 添加订阅并启动:
        vpn sub add "<订阅URL>" "我的订阅"
        vpn on

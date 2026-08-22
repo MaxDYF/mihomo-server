@@ -22,9 +22,42 @@ MIHOMO_DIR="${MIHOMO_DIR:-${CLASH_DIR:-$HOME/clash}}"
 MIHOMO_BIN="${MIHOMO_BIN:-${CLASH_BIN:-$MIHOMO_DIR/mihomo}}"
 MIHOMO_LOG="${MIHOMO_LOG:-${CLASH_LOG:-$MIHOMO_DIR/mihomo.log}}"
 MIHOMO_PIDFILE="${MIHOMO_PIDFILE:-$MIHOMO_DIR/mihomo.pid}"
-PROXY_PORT="${PROXY_PORT:-7890}"
-SOCKS_PORT="${SOCKS_PORT:-7891}"
-HTTP_PORT="${HTTP_PORT:-7892}"
+# ---- 端口设置 ----
+# 优先级：环境变量 > $MIHOMO_DIR/ports.conf（KEY=VALUE 格式）> 默认值
+# 共享服务器上若默认端口被其他用户的实例占用，在此换一套专属端口即可，例如：
+#   PROXY_PORT=17890
+#   SOCKS_PORT=17891
+#   HTTP_PORT=17892
+#   CONTROL_PORT=19090
+PORTS_CONF="${PORTS_CONF:-$MIHOMO_DIR/ports.conf}"
+
+_vpn_conf_get() {
+    # 从 ports.conf 读取 KEY 的值（忽略空行与 # 注释）
+    local f="$PORTS_CONF" key="$1" line k v
+    [ -r "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        case "$line" in *=*) ;; *) continue ;; esac
+        k="${line%%=*}"
+        v="${line#*=}"
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        if [ "$k" = "$key" ] && [ -n "$v" ]; then
+            printf '%s\n' "$v"
+            return 0
+        fi
+    done < "$f"
+}
+
+# 用户显式设置的端口值（环境变量或 ports.conf）；为空表示未显式指定，
+# 生成配置时将保留 config.base.yaml 中原有的端口设置
+VPN_PROXY_PORT_SET="${PROXY_PORT:-$(_vpn_conf_get PROXY_PORT)}"
+VPN_SOCKS_PORT_SET="${SOCKS_PORT:-$(_vpn_conf_get SOCKS_PORT)}"
+VPN_HTTP_PORT_SET="${HTTP_PORT:-$(_vpn_conf_get HTTP_PORT)}"
+
+PROXY_PORT="${VPN_PROXY_PORT_SET:-7890}"
+SOCKS_PORT="${VPN_SOCKS_PORT_SET:-7891}"
+HTTP_PORT="${VPN_HTTP_PORT_SET:-7892}"
 LISTEN_PORTS="${LISTEN_PORTS:-$PROXY_PORT $SOCKS_PORT $HTTP_PORT}"
 NO_PROXY_LIST="localhost,127.0.0.1,::1,*.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1"
 
@@ -41,6 +74,7 @@ SUB_UA="${SUB_UA:-clash-verge/v2.0.0}"
 SUB_HEALTH_URL="${SUB_HEALTH_URL:-http://cp.cloudflare.com/generate_204}"
 
 # ---- 控制 API（节点切换/全局模式）----
+CONTROL_PORT="${CONTROL_PORT:-$(_vpn_conf_get CONTROL_PORT)}"
 CONTROL_PORT="${CONTROL_PORT:-9090}"
 CONTROL_SECRET_FILE="${CONTROL_SECRET_FILE:-$SUBS_DIR/controller.secret}"
 
@@ -59,7 +93,11 @@ _vpn_mihomo_pid() {
         rm -f "$MIHOMO_PIDFILE"
     fi
 
-    pgrep -x -f -- "$MIHOMO_BIN -d $MIHOMO_DIR" | head -n 1
+    # 兜底按命令行查找（pgrep 在部分老系统上不可用，改用 ps 按字段精确匹配，
+    # 避免子串误匹配到搜索进程自身）
+    ps -eo pid=,args= 2>/dev/null \
+        | awk -v bin="$MIHOMO_BIN" -v dir="$MIHOMO_DIR" \
+            '$2 == bin && $3 == "-d" && $4 == dir {print $1; exit}'
 }
 
 _vpn_mihomo_running() {
@@ -70,6 +108,50 @@ _vpn_port_listening() {
     ss -ltnH 2>/dev/null | grep -Eq ":${1}[[:space:]]"
 }
 
+_vpn_pid_owns_port() {
+    # 判断本用户的指定 pid 是否监听了指定端口（ss 仅对本用户进程显示 pid）
+    ss -ltnpH "sport = :$2" 2>/dev/null | grep -qE "pid=${1}[),]"
+}
+
+_vpn_port_owner_desc() {
+    # 输出监听端口的进程描述（进程名+pid）；其他用户的进程无权限查看，返回空
+    ss -ltnpH "sport = :$1" 2>/dev/null \
+        | grep -oE '"[^"]+",pid=[0-9]+' | sort -u | head -n 5
+}
+
+_vpn_check_ports() {
+    # 启动前检测所需端口：空闲或已被自己的实例监听才放行
+    local port self busy=0 seen=" " owner
+    for port in $PROXY_PORT $SOCKS_PORT $HTTP_PORT $CONTROL_PORT; do
+        case "$seen" in *" $port "*) continue ;; esac
+        seen="$seen$port "
+        _vpn_port_listening "$port" || continue
+
+        # 端口已被监听：若是自己的 Mihomo 则视为正常（重复 vpn on 场景）
+        self=$(_vpn_mihomo_pid)
+        if [ -n "$self" ] && _vpn_pid_owns_port "$self" "$port"; then
+            continue
+        fi
+
+        owner=$(_vpn_port_owner_desc "$port")
+        if [ -n "$owner" ]; then
+            echo "[vpn] 错误：端口 $port 已被其他进程占用 → $owner" >&2
+        else
+            echo "[vpn] 错误：端口 $port 已被占用（无权限查看详情，通常是其他用户的进程）" >&2
+        fi
+        busy=1
+    done
+    [ "$busy" = 0 ] && return 0
+    cat >&2 <<EOF
+[vpn] 解决办法：
+  1. 若是残留的旧实例：先执行 vpn stop 再重试；
+  2. 共享服务器上请换一套专属端口（写入 $PORTS_CONF 或用环境变量）：
+       PROXY_PORT=<空闲端口> SOCKS_PORT=... HTTP_PORT=... CONTROL_PORT=...
+     之后重新执行 vpn on / vpn restart。
+EOF
+    return 1
+}
+
 _vpn_start_mihomo() {
     local pid i
     pid="$(_vpn_mihomo_pid)"
@@ -77,6 +159,9 @@ _vpn_start_mihomo() {
         echo "[vpn] Mihomo 已在运行（PID: $pid）"
         return 0
     fi
+
+    # 每次启动前检测端口是否被占用（防止绑定失败后静默降级）
+    _vpn_check_ports || return 1
 
     if [ ! -x "$MIHOMO_BIN" ]; then
         echo "[vpn] 错误：找不到可执行文件 $MIHOMO_BIN" >&2
@@ -87,22 +172,24 @@ _vpn_start_mihomo() {
     pid=$!
     printf '%s\n' "$pid" > "$MIHOMO_PIDFILE"
 
-    # 等混合代理端口起来
+    # 等混合代理端口起来；必须确认是本进程在监听，
+    # 否则可能误把别人的监听当成启动成功（共享服务器常见）
     for i in 1 2 3 4 5 6 7 8 9 10; do
         if ! kill -0 "$pid" 2>/dev/null; then
             rm -f "$MIHOMO_PIDFILE"
             echo "[vpn] Mihomo 启动失败，请查看日志：tail -f $MIHOMO_LOG" >&2
             return 1
         fi
-        if _vpn_port_listening "$PROXY_PORT"; then
+        if _vpn_pid_owns_port "$pid" "$PROXY_PORT"; then
             echo "[vpn] Mihomo 已启动（PID: $pid），监听 :$PROXY_PORT"
             return 0
         fi
         sleep 0.5
     done
 
-    echo "[vpn] 警告：启动 5s 后端口 $PROXY_PORT 仍未监听，请查看日志：tail -f $MIHOMO_LOG" >&2
-    echo "[vpn] 进程 PID: $pid"
+    rm -f "$MIHOMO_PIDFILE"
+    echo "[vpn] 启动超时：本进程未能在 :$PROXY_PORT 上监听，最近日志：" >&2
+    grep -E 'level=(error|warning)' "$MIHOMO_LOG" 2>/dev/null | tail -n 3 | sed 's/^/[vpn]   /' >&2
     return 1
 }
 
@@ -155,175 +242,6 @@ _vpn_test() {
 }
 
 # ---- 订阅管理 ----
-_vpn_sub_py() {
-    python3 - "$@" <<'PYEOF'
-import sys, yaml, base64
-
-def doc_proxies(doc):
-    if isinstance(doc, dict):
-        for k in ('proxies', 'Proxy'):
-            if isinstance(doc.get(k), list):
-                return doc[k]
-    if isinstance(doc, list):
-        return doc
-    return None
-
-def load(text):
-    try:
-        return yaml.safe_load(text)
-    except Exception:
-        return None
-
-def maybe_base64(text):
-    try:
-        t = text.strip().translate(str.maketrans('', '', ' \t\r\n'))
-        t += '=' * ((4 - len(t) % 4) % 4)
-        dec = base64.b64decode(t).decode('utf-8', errors='replace')
-        return dec if doc_proxies(load(dec)) is not None else None
-    except Exception:
-        return None
-
-cmd = sys.argv[1]
-
-if cmd == 'extract':
-    # 原始订阅文件 -> 规范化代理列表文件；成功输出节点数
-    raw, out = sys.argv[2], sys.argv[3]
-    text = open(raw, encoding='utf-8', errors='replace').read()
-    doc = load(text)
-    proxies = doc_proxies(doc)
-    if proxies is None:
-        dec = maybe_base64(text)
-        if dec is not None:
-            doc = load(dec)
-            proxies = doc_proxies(doc)
-    if proxies is None:
-        sys.exit('no proxy list found')
-    seen, cleaned = {}, []
-    for p in proxies:
-        if not isinstance(p, dict) or not isinstance(p.get('name'), str) \
-                or not isinstance(p.get('type'), str) or not p['name']:
-            continue
-        name = p['name']
-        if name in seen:
-            seen[name] += 1
-            p = dict(p)
-            p['name'] = '%s (%d)' % (name, seen[name])
-        else:
-            seen[name] = 0
-        cleaned.append(p)
-    if not cleaned:
-        sys.exit('empty proxy list')
-    with open(out, 'w', encoding='utf-8') as f:
-        yaml.safe_dump({'proxies': cleaned}, f, allow_unicode=True, sort_keys=False)
-    print(len(cleaned))
-
-elif cmd == 'migrate':
-    # 现有 config.yaml -> base 配置 + 默认订阅代理列表；输出节点数
-    src, base_out, prov_out = sys.argv[2], sys.argv[3], sys.argv[4]
-    doc = load(open(src, encoding='utf-8').read()) or {}
-    proxies = doc.get('proxies') or []
-    for k in ('proxies', 'proxy-providers', 'proxy-groups'):
-        doc.pop(k, None)
-    with open(base_out, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False)
-    with open(prov_out, 'w', encoding='utf-8') as f:
-        yaml.safe_dump({'proxies': proxies}, f, allow_unicode=True, sort_keys=False)
-    print(len(proxies))
-
-elif cmd == 'minimal':
-    # 无任何配置时生成最小 base 配置
-    with open(sys.argv[2], 'w', encoding='utf-8') as f:
-        yaml.safe_dump({
-            'mixed-port': 7890,
-            'allow-lan': True,
-            'mode': 'rule',
-            'log-level': 'info',
-            'dns': {'enable': True, 'enhanced-mode': 'fake-ip', 'nameserver': ['223.5.5.5']},
-            'rules': ['MATCH,🚀节点选择'],
-        }, f, allow_unicode=True, sort_keys=False)
-    print('ok')
-
-elif cmd == 'gen':
-    # base + 当前订阅 -> config.yaml
-    base_file, out, pid, pfile = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-    base = load(open(base_file, encoding='utf-8').read()) or {}
-    for k in ('proxies', 'proxy-providers', 'proxy-groups'):
-        base.pop(k, None)
-    base['proxy-providers'] = {
-        pid: {
-            'type': 'file',
-            'path': pfile,
-            'health-check': {
-                'enable': True,
-                'url': sys.argv[6] if len(sys.argv) > 6 else 'http://cp.cloudflare.com/generate_204',
-                'interval': 300,
-            },
-        }
-    }
-    base['external-controller'] = '127.0.0.1:%s' % (sys.argv[7] if len(sys.argv) > 7 else '9090')
-    if len(sys.argv) > 8 and sys.argv[8]:
-        base['secret'] = sys.argv[8]
-    if len(sys.argv) > 9 and sys.argv[9]:
-        base['mode'] = sys.argv[9]
-    groups = [
-        {'name': '🚀节点选择', 'type': 'select',
-         'proxies': ['♻️自动选择', 'DIRECT'], 'use': [pid]},
-        {'name': '♻️自动选择', 'type': 'url-test',
-         'url': 'http://cp.cloudflare.com/generate_204', 'interval': 300, 'use': [pid]},
-        {'name': '🐟漏网之鱼', 'type': 'select',
-         'proxies': ['🚀节点选择', 'DIRECT']},
-        {'name': '🛑广告拦截', 'type': 'select',
-         'proxies': ['REJECT', 'DIRECT']},
-    ]
-    # 扫描 rules 中被引用但未定义的策略组，自动补一个 select 组，
-    # 避免因旧配置残留的组名导致 mihomo 解析失败
-    BUILTIN = {'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL'}
-    OPTIONS = {'no-resolve', 'force-remote-dns', 'force-ipv6', 'force-ipv4', 'ip-asn', 'resolve'}
-    known = {g['name'] for g in groups}
-    extra = set()
-    for r in (base.get('rules') or []):
-        if not isinstance(r, str):
-            continue
-        parts = r.split(',')
-        if len(parts) < 3:
-            continue
-        t = parts[-1].strip()
-        if t in OPTIONS and len(parts) >= 4:
-            t = parts[-2].strip()
-        if not t or t in BUILTIN or t in known or t in OPTIONS:
-            continue
-        extra.add(t)
-    for t in sorted(extra):
-        groups.append({'name': t, 'type': 'select', 'use': [pid]})
-    base['proxy-groups'] = groups
-    with open(out, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(base, f, allow_unicode=True, sort_keys=False)
-    print('ok')
-
-elif cmd == 'api':
-    # 控制 API 封装：api <METHOD> <PATH> [JSON_BODY] <PORT> <SECRET>
-    import urllib.request, urllib.parse
-    method, path = sys.argv[2], sys.argv[3]
-    body = sys.argv[4] if len(sys.argv) > 4 else None
-    port = sys.argv[5] if len(sys.argv) > 5 else '9090'
-    secret = sys.argv[6] if len(sys.argv) > 6 else ''
-    url = 'http://127.0.0.1:%s%s' % (port, urllib.parse.quote(path, safe='/'))
-    req = urllib.request.Request(url, method=method)
-    req.add_header('Authorization', 'Bearer ' + secret)
-    if body is not None:
-        req.add_header('Content-Type', 'application/json')
-        req.data = body.encode('utf-8')
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            out = r.read().decode('utf-8', errors='replace')
-            if out:
-                print(out)
-            sys.exit(0 if r.status < 400 else 1)
-    except Exception as e:
-        sys.stderr.write('API 请求失败: %s\n' % e)
-        sys.exit(1)
-PYEOF
-}
 
 _vpn_sub_entry() {
     awk -F '\t' -v k="$1" '$1==k || $2==k {print; exit}' "$SUBS_LIST" 2>/dev/null
@@ -335,16 +253,25 @@ _vpn_sub_id() {
     [ -n "$line" ] && printf '%s\n' "$line" | cut -f1
 }
 
+_vpn_b64_decode() {
+    # 标准/urlsafe base64 解码（容忍空白与缺失 padding）；stdin -> stdout
+    local pad tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vpnb64.XXXXXX")" || return 1
+    tr -d ' \t\r\n' | tr '_-' '/+' > "$tmp"
+    pad=$(( (4 - $(wc -c < "$tmp") % 4) % 4 ))
+    while [ "$pad" -gt 0 ]; do printf '=' >> "$tmp"; pad=$((pad - 1)); done
+    base64 -d "$tmp"
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
 _vpn_sub_url_decode() {
-    local url="$1"
+    local url="$1" real
     case "$url" in
         sub://*)
-            python3 -c '
-import sys, base64
-s = sys.argv[1][6:]
-s += "=" * ((4 - len(s) % 4) % 4)
-print(base64.urlsafe_b64decode(s).decode("utf-8"), end="")' "$url" 2>/dev/null \
-                || printf '%s' "$url"
+            real=$(_vpn_b64_decode <<< "${url#sub://}" 2>/dev/null) \
+                && printf '%s' "$real" || printf '%s' "$url"
             ;;
         *) printf '%s' "$url" ;;
     esac
@@ -357,9 +284,216 @@ _vpn_sub_fetch() {
         -A "$SUB_UA" -o "$out" "$real" 2>/dev/null
 }
 
+# ---- 纯 Shell 工具集（替代原内嵌 Python：URL 编码 / JSON 解析 / YAML 处理）----
+
+_vpn_url_encode() {
+    # 百分号编码（保留 '/'），用于控制 API 路径中的中文/emoji 组名
+    (
+        export LC_ALL=C
+        local s="$1" out="" i ch
+        for ((i = 0; i < ${#s}; i++)); do
+            ch="${s:i:1}"
+            case "$ch" in
+                [a-zA-Z0-9._~/-]) out+="$ch" ;;
+                *) out+="$(printf '%s' "$ch" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')" ;;
+            esac
+        done
+        printf '%s' "$out"
+    )
+}
+
+_vpn_json_get_str() {
+    # 读取 JSON 顶层字符串字段: _vpn_json_get_str <json> <key>
+    local json="$1" key="$2" pat rest i ch esc=0 out=""
+    pat="\"${key}\":"
+    case "$json" in *"$pat"*) rest="${json#*"$pat"}" ;; *) return 1 ;; esac
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    case "$rest" in '"'*) ;; *) return 1 ;; esac
+    rest="${rest:1}"
+    for ((i = 0; i < ${#rest}; i++)); do
+        ch="${rest:i:1}"
+        if [ "$esc" = 1 ]; then
+            out+="$ch"; esc=0
+        elif [ "$ch" = '\' ]; then
+            esc=1
+        elif [ "$ch" = '"' ]; then
+            break
+        else
+            out+="$ch"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+_vpn_json_get_arr() {
+    # 读取 JSON 字符串数组字段，逐行输出各元素: _vpn_json_get_arr <json> <key>
+    local json="$1" key="$2" pat rest i ch cur="" instr=0 esc=0 res=""
+    pat="\"${key}\":["
+    case "$json" in *"$pat"*) rest="${json#*"$pat"}" ;; *) return 1 ;; esac
+    for ((i = 0; i < ${#rest}; i++)); do
+        ch="${rest:i:1}"
+        if [ "$instr" = 1 ]; then
+            if [ "$esc" = 1 ]; then cur+="$ch"; esc=0; continue; fi
+            case "$ch" in
+                '\') esc=1 ;;
+                '"') instr=0; res+="$cur"$'\n' ;;
+                *) cur+="$ch" ;;
+            esac
+        else
+            case "$ch" in
+                '"') instr=1; cur="" ;;
+                ']') printf '%s' "$res"; return 0 ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+_vpn_yaml_strip_sections() {
+    # 删除 YAML 中指定顶层键所在的整块内容: <src> <dst> <键1:键2:...>
+    awk -v keys="$3" '
+        BEGIN {
+            n = split(keys, a, ":")
+            for (i = 1; i <= n; i++) if (a[i] != "") drop[a[i]] = 1
+        }
+        /^[A-Za-z][A-Za-z0-9_-]*[[:space:]]*:/ {
+            k = $0
+            sub(/[[:space:]]*:.*$/, "", k)
+            skip = (k in drop) ? 1 : 0
+        }
+        !skip { print }
+    ' "$1" > "$2"
+}
+
+_vpn_yaml_top_scalar() {
+    # 读取顶层标量键的行内值: _vpn_yaml_top_scalar <file> <key>
+    awk -v key="$2" '
+        $0 ~ "^" key "[[:space:]]*:" {
+            sub("^" key "[[:space:]]*:[[:space:]]*", "")
+            print
+            exit
+        }
+    ' "$1"
+}
+
+_vpn_rule_extra_groups() {
+    # 扫描 rules 中被引用但生成模板未定义的策略组名（每行一个，已排序）
+    awk '
+        BEGIN {
+            ns = split("🚀节点选择 ♻️自动选择 🐟漏网之鱼 🛑广告拦截 DIRECT REJECT REJECT-DROP PASS COMPATIBLE GLOBAL", b, " ")
+            for (i = 1; i <= ns; i++) known[b[i]] = 1
+            no = split("no-resolve force-remote-dns force-ipv6 force-ipv4 ip-asn resolve", o, " ")
+            for (i = 1; i <= no; i++) opt[o[i]] = 1
+        }
+        /^rules:[[:space:]]*(#.*)?$/ { inr = 1; next }
+        /^[^[:space:]#]/ { inr = 0 }
+        inr && /^[[:space:]]*-([[:space:]]|$)/ {
+            line = $0
+            sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+            cnt = split(line, p, ",")
+            t = p[cnt]
+            gsub(/[[:space:]]/, "", t)
+            if (t == "") next
+            if (t in opt) {
+                if (cnt < 2) next
+                t = p[cnt - 1]
+                gsub(/[[:space:]]/, "", t)
+            }
+            if ((t in known) || (t in opt)) next
+            extra[t] = 1
+        }
+        END { for (e in extra) print e }
+    ' "$1" | sort
+}
+
+_vpn_write_minimal_base() {
+    cat > "$1" <<EOF
+mixed-port: ${VPN_PROXY_PORT_SET:-7890}
+allow-lan: true
+mode: rule
+log-level: info
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - 223.5.5.5
+rules:
+  - MATCH,🚀节点选择
+EOF
+}
+
+_vpn_count_proxies() {
+    # 统计含 proxies: 块的文件中的节点条目数
+    awk '/^(proxies|Proxy):[[:space:]]*(#.*)?$/ { p = 1; next }
+         /^[^[:space:]#]/ { p = 0 }
+         p && /^[[:space:]]*-([[:space:]]|$)/ { c++ }
+         END { print c + 0 }' "$1"
+}
+
+_vpn_migrate_legacy_config() {
+    # 旧 config.yaml -> 基础配置 + 默认订阅（proxies 原样搬移）；stdout 输出节点数。
+    # 先写临时文件校验，成功后才覆盖目标，避免失败时破坏现有数据
+    local src="$1" base_out="$2" prov_out="$3" n tmpp tmpb
+    tmpp="$prov_out.tmp.$$"
+    tmpb="$base_out.tmp.$$"
+    awk '
+        /^[A-Za-z][A-Za-z0-9_-]*[[:space:]]*:/ {
+            p = ($0 ~ /^(proxies|Proxy)[[:space:]]*:/) ? 1 : 0
+        }
+        p { print }
+    ' "$src" > "$tmpp"
+    n=$(_vpn_count_proxies "$tmpp")
+    if [ ! -s "$tmpp" ] || [ "$n" -eq 0 ] 2>/dev/null; then
+        rm -f "$tmpp" "$tmpb"
+        return 1
+    fi
+    _vpn_yaml_strip_sections "$src" "$tmpb" "proxies:Proxy:proxy-providers:proxy-groups:"
+    mv -f "$tmpp" "$prov_out"
+    mv -f "$tmpb" "$base_out"
+    echo "$n"
+}
+
 _vpn_sub_normalize() {
-    local raw="$1" out="$2"
-    _vpn_sub_py extract "$raw" "$out"
+    # 规范化订阅为 mihomo 可用的 provider 文件；stdout 输出节点数。
+    # Clash YAML 直接透传（mihomo 支持把含 proxies: 的完整配置作为 file provider）；
+    # 纯 base64 订阅先解码为 URI 列表（mihomo 可解析 ss/vmess/trojan 等分享链接）
+    local raw="$1" out="$2" n dups
+    if grep -Eq '^(proxies|Proxy)[[:space:]]*:' "$raw"; then
+        cp -f -- "$raw" "$out"
+    else
+        # 尝试按 base64 订阅解码（标准/urlsafe），得到 URI 列表或 YAML 文本
+        _vpn_b64_decode < "$raw" > "$out" 2>/dev/null || { rm -f "$out"; return 1; }
+        if ! grep -Eq '^(proxies|Proxy)[[:space:]]*:' "$out" && ! grep -q '://' "$out"; then
+            rm -f "$out"
+            return 1
+        fi
+    fi
+    n=$(_vpn_count_proxies "$out")
+    if [ "$n" -eq 0 ] 2>/dev/null; then
+        n=$(grep -c '://' "$out" 2>/dev/null || true)
+        n=${n:-0}
+    fi
+    if [ "$n" -eq 0 ] 2>/dev/null; then
+        echo "[vpn] 订阅解析失败：找不到代理列表" >&2
+        rm -f "$out"
+        return 1
+    fi
+    # 重名检测（提示性；不再像旧版那样静默改名）
+    if grep -Eq '^(proxies|Proxy)[[:space:]]*:' "$out"; then
+        dups=$(awk '/^(proxies|Proxy):[[:space:]]*(#.*)?$/ { p = 1; next }
+                    /^[^[:space:]#]/ { p = 0 }
+                    p && /(^|[[:space:]])name:/ {
+                        s = $0
+                        sub(/^.*name:[[:space:]]*/, "", s)
+                        print s
+                    }' "$out" \
+                | sed 's/[",].*$//' | sort | uniq -d)
+        if [ -n "$dups" ]; then
+            echo "[vpn] 警告：订阅存在重名节点（mihomo 可能拒绝加载），请更新订阅：" >&2
+            printf '%s\n' "$dups" | sed 's/^/[vpn]       /' >&2
+        fi
+    fi
+    echo "$n"
 }
 
 _vpn_sub_ensure() {
@@ -368,7 +502,7 @@ _vpn_sub_ensure() {
     # 首次使用：把现有 config.yaml 的 proxies/proxy-groups 抽离为「默认订阅」
     if [ ! -f "$SUBS_LIST" ]; then
         if [ -f "$CONFIG_FILE" ]; then
-            n=$(_vpn_sub_py migrate "$CONFIG_FILE" "$BASE_CONFIG" "$SUBS_DIR/sub_1.yaml")
+            n=$(_vpn_migrate_legacy_config "$CONFIG_FILE" "$BASE_CONFIG" "$SUBS_DIR/sub_1.yaml")
             if [ $? -eq 0 ] && [ -n "$n" ]; then
                 cp -f "$CONFIG_FILE" "$CONFIG_FILE.bak-inline" 2>/dev/null || true
                 printf 'sub_1\t默认订阅\tlocal\t%s\n' "$(date +%s)" > "$SUBS_LIST"
@@ -389,7 +523,7 @@ _vpn_sub_ensure() {
 
     # 无基础配置时生成最小模板（仅首次且无 config.yaml 时）
     if [ ! -f "$BASE_CONFIG" ] && [ ! -f "$CONFIG_FILE" ]; then
-        _vpn_sub_py minimal "$BASE_CONFIG" >/dev/null 2>&1 \
+        _vpn_write_minimal_base "$BASE_CONFIG" \
             && echo "[vpn] 已生成最小基础配置 $BASE_CONFIG"
     fi
 
@@ -400,15 +534,93 @@ _vpn_sub_ensure() {
 }
 
 _vpn_sub_gen_config() {
-    local id="$1" mode
+    # 由基础配置 + 当前订阅生成 $CONFIG_FILE（纯 shell 实现）
+    local id="$1" mode tmp strip qn
     [ -f "$BASE_CONFIG" ] || { echo "[vpn] 错误：缺少基础配置 $BASE_CONFIG" >&2; return 1; }
     [ -f "$SUBS_DIR/$id.yaml" ] || { echo "[vpn] 错误：缺少订阅文件 $SUBS_DIR/$id.yaml" >&2; return 1; }
     mode=$(_vpn_current_mode)
-    _vpn_sub_py gen "$BASE_CONFIG" "$CONFIG_FILE" "$id" "subs/$id.yaml" "$SUB_HEALTH_URL" \
-        "$CONTROL_PORT" "$(_vpn_control_secret)" "$mode" >/dev/null || {
-        echo "[vpn] 生成 $CONFIG_FILE 失败" >&2
-        return 1
-    }
+
+    # 剥离由脚本统一注入的顶层键；端口仅在显式设置时接管（否则保留 base 原值）
+    strip="proxies:Proxy:proxy-providers:proxy-groups:external-controller:secret:mode:"
+    if [ -n "${VPN_PROXY_PORT_SET}${VPN_SOCKS_PORT_SET}${VPN_HTTP_PORT_SET}" ]; then
+        strip="${strip}mixed-port:socks-port:port:"
+    fi
+
+    tmp="$CONFIG_FILE.tmp.$$"
+    _vpn_yaml_strip_sections "$BASE_CONFIG" "$tmp" "$strip"
+
+    {
+        echo ""
+        cat <<EOF
+external-controller: 127.0.0.1:$CONTROL_PORT
+secret: $(_vpn_control_secret)
+EOF
+        [ -n "$mode" ] && echo "mode: $mode"
+
+        if [ -n "$VPN_PROXY_PORT_SET" ]; then
+            echo "mixed-port: $VPN_PROXY_PORT_SET"
+            if [ -n "$VPN_SOCKS_PORT_SET" ] && [ "$VPN_SOCKS_PORT_SET" != "$VPN_PROXY_PORT_SET" ]; then
+                echo "socks-port: $VPN_SOCKS_PORT_SET"
+            fi
+            if [ -n "$VPN_HTTP_PORT_SET" ] && [ "$VPN_HTTP_PORT_SET" != "$VPN_PROXY_PORT_SET" ] \
+                && { [ -z "$VPN_SOCKS_PORT_SET" ] || [ "$VPN_HTTP_PORT_SET" != "$VPN_SOCKS_PORT_SET" ]; }; then
+                echo "port: $VPN_HTTP_PORT_SET"
+            fi
+        elif [ -n "${VPN_SOCKS_PORT_SET}${VPN_HTTP_PORT_SET}" ]; then
+            # 未显式设置 mixed-port：保留基础配置端口，仅覆盖显式给出的独立端口
+            [ -n "$VPN_SOCKS_PORT_SET" ] && echo "socks-port: $VPN_SOCKS_PORT_SET"
+            [ -n "$VPN_HTTP_PORT_SET" ] && echo "port: $VPN_HTTP_PORT_SET"
+        fi
+
+        cat <<EOF
+
+proxy-providers:
+  $id:
+    type: file
+    path: subs/$id.yaml
+    health-check:
+      enable: true
+      url: $SUB_HEALTH_URL
+      interval: 300
+
+proxy-groups:
+  - name: 🚀节点选择
+    type: select
+    proxies:
+      - ♻️自动选择
+      - DIRECT
+    use:
+      - $id
+  - name: ♻️自动选择
+    type: url-test
+    url: http://cp.cloudflare.com/generate_204
+    interval: 300
+    use:
+      - $id
+  - name: 🐟漏网之鱼
+    type: select
+    proxies:
+      - 🚀节点选择
+      - DIRECT
+  - name: 🛑广告拦截
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+EOF
+        # rules 引用但模板未定义的策略组：自动补 select 组，避免 mihomo 解析失败
+        while IFS= read -r qn; do
+            [ -n "$qn" ] || continue
+            cat <<EOF
+  - name: $qn
+    type: select
+    use:
+      - $id
+EOF
+        done < <(_vpn_rule_extra_groups "$BASE_CONFIG")
+    } >> "$tmp"
+
+    mv -f "$tmp" "$CONFIG_FILE"
     return 0
 }
 
@@ -423,12 +635,37 @@ _vpn_control_secret() {
 }
 
 _vpn_api() {
-    # _vpn_api <METHOD> <PATH> [JSON_BODY]
-    local out rc
-    out=$(_vpn_sub_py api "$1" "$2" "${3-}" "$CONTROL_PORT" "$(_vpn_control_secret)")
-    rc=$?
-    if [ "$rc" != "0" ]; then
-        echo "[vpn] API 请求失败（请确认已 vpn on，且控制端口 $CONTROL_PORT 可用）" >&2
+    # _vpn_api <METHOD> <PATH> [JSON_BODY] —— 基于 curl 的控制 API 调用
+    local method="$1" path="$2" body="${3:-}"
+    local rest enc="/" seg out rc http_code
+    rest="${path#/}"
+    while [ -n "$rest" ]; do
+        seg="${rest%%/*}"
+        enc+="$(_vpn_url_encode "$seg")"
+        case "$rest" in
+            */*) enc+="/"; rest="${rest#*/}" ;;
+            *) break ;;
+        esac
+    done
+
+    if [ -n "$body" ]; then
+        out=$(curl -s --max-time 5 -X "$method" \
+            -H "Authorization: Bearer $(_vpn_control_secret)" \
+            -H 'Content-Type: application/json' \
+            --data-binary "$body" \
+            -w '\n%{http_code}' "http://127.0.0.1:$CONTROL_PORT$enc" 2>/dev/null)
+        rc=$?
+    else
+        out=$(curl -s --max-time 5 -X "$method" \
+            -H "Authorization: Bearer $(_vpn_control_secret)" \
+            -w '\n%{http_code}' "http://127.0.0.1:$CONTROL_PORT$enc" 2>/dev/null)
+        rc=$?
+    fi
+    http_code="${out##*$'\n'}"
+    out="${out%$'\n'*}"
+    case "${http_code:-x}" in *[!0-9]*|'') http_code="" ;; esac
+    if [ "$rc" != 0 ] || [ -z "$http_code" ] || [ "$http_code" -ge 400 ] 2>/dev/null; then
+        echo "[vpn] API 请求失败（HTTP ${http_code:-curl 错误码 $rc}；请确认已 vpn on，且控制端口 $CONTROL_PORT 可用）" >&2
         return 1
     fi
     printf '%s\n' "$out"
@@ -734,42 +971,45 @@ EOF
 }
 
 # ---- 节点切换 / 全局模式 ----
+_VPN_SKIP_NODES="♻️自动选择 🐟漏网之鱼 🛑广告拦截 🎬媒体解锁 🤖AI网站 REJECT REJECT-DROP PASS COMPATIBLE GLOBAL default"
+
+_vpn_node_skipped() {
+    case "$_VPN_SKIP_NODES" in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
 _vpn_node_filter() {
-    # 过滤策略组与特殊名称，只留真实节点（含 DIRECT），输出带序号
-    python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-skip = {"♻️自动选择", "🐟漏网之鱼", "🛑广告拦截", "🎬媒体解锁", "🤖AI网站",
-        "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", "default"}
-now = d.get("now", "")
-i = 0
-for n in d.get("all", []):
-    if n in skip:
-        continue
-    i += 1
-    mark = "*" if n == now else " "
-    print("%s %3d. %s" % (mark, i, n))
-'
+    # 过滤策略组与特殊名称，只留真实节点（含 DIRECT），输出带序号（stdin: 组 JSON）
+    local data now n i=0 mark
+    data=$(cat)
+    now=$(_vpn_json_get_str "$data" now 2>/dev/null) || now=""
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        _vpn_node_skipped "$n" && continue
+        i=$((i + 1))
+        if [ "$n" = "$now" ]; then mark='*'; else mark=' '; fi
+        printf '%s %3d. %s\n' "$mark" "$i" "$n"
+    done < <(_vpn_json_get_arr "$data" all)
 }
 
 _vpn_node_pick() {
-    # 解析名称或序号 -> 节点名；输出到 stdout
-    local key="$1"
+    # 解析名称或序号 -> 节点名；输出到 stdout（stdin: 组 JSON）
+    local key="$1" data n i=0
     printf '%s' "$key" | grep -Eq '^[0-9]+$' || {
         printf '%s\n' "$key"
         return 0
     }
-    python3 -c '
-import json, sys
-key = int(sys.argv[1])
-skip = {"♻️自动选择", "🐟漏网之鱼", "🛑广告拦截", "🎬媒体解锁", "🤖AI网站",
-        "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", "default"}
-items = [n for n in json.load(sys.stdin).get("all", []) if n not in skip]
-if 1 <= key <= len(items):
-    print(items[key - 1])
-else:
-    sys.exit(1)
-' "$key"
+    data=$(cat)
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        _vpn_node_skipped "$n" && continue
+        i=$((i + 1))
+        if [ "$i" = "$key" ]; then
+            printf '%s\n' "$n"
+            return 0
+        fi
+    done < <(_vpn_json_get_arr "$data" all)
+    return 1
 }
 
 vpn_node() {
@@ -793,7 +1033,7 @@ vpn_node() {
                 return 1
             }
             _vpn_api PUT "/proxies/$group" \
-                "$(python3 -c "import json,sys; print(json.dumps({'name': sys.argv[1]}))" "$target")" >/dev/null || return 1
+                "$(printf '{"name":"%s"}' "${target//\"/\\\"}")" >/dev/null || return 1
             echo "[vpn] 已切换: $group → $target"
             ;;
         auto)
@@ -802,7 +1042,7 @@ vpn_node() {
             ;;
         show|status)
             data=$(_vpn_api GET "/proxies/$group") || return 1
-            now=$(printf '%s' "$data" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("now",""))')
+            now=$(_vpn_json_get_str "$data" now 2>/dev/null) || now=""
             if [ "$(_vpn_current_mode)" = "global" ]; then
                 echo "全局模式: GLOBAL → 🚀节点选择 → $now（所有流量走该节点）"
             else
@@ -880,8 +1120,8 @@ vpn() {
                 "$MIHOMO_BIN" -v 2>&1 | head -n 1 | sed 's/^/  版本: /'
             fi
             echo "===== 端口监听 ====="
-            for port in $LISTEN_PORTS; do
-                port_info=$(ss -ltn 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
+            for port in $LISTEN_PORTS $CONTROL_PORT; do
+                port_info=$(ss -ltnH 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
                 if [ -n "$port_info" ]; then
                     echo "$port_info" | sed 's/^/  /'
                 fi
@@ -914,10 +1154,11 @@ vpn() {
             if _vpn_mihomo_running; then
                 local node_mode node_group node_now node_data
                 node_mode=$(_vpn_current_mode)
-                [ -z "$node_mode" ] && node_mode=$(python3 -c "import yaml; print(yaml.safe_load(open('$BASE_CONFIG')).get('mode','rule'))" 2>/dev/null || echo rule)
+                [ -z "$node_mode" ] && node_mode=$(_vpn_yaml_top_scalar "$BASE_CONFIG" mode 2>/dev/null)
+                [ -z "$node_mode" ] && node_mode=rule
                 node_group=$(_vpn_current_group)
                 node_data=$(_vpn_api GET "/proxies/$node_group" 2>/dev/null) && {
-                    node_now=$(printf '%s' "$node_data" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("now",""))')
+                    node_now=$(_vpn_json_get_str "$node_data" now 2>/dev/null) || node_now=""
                     echo "  模式: $node_mode  当前节点: $node_now"
                     echo "  切换: vpn node list | vpn node use <名称> | vpn node auto"
                 } || echo "  模式: $node_mode（控制器未就绪，重启后可用 vpn node）"
@@ -958,7 +1199,7 @@ vpn() {
                 status)
                     local mode base_mode
                     mode=$(_vpn_current_mode)
-                    base_mode=$(python3 -c "import yaml; print(yaml.safe_load(open('$BASE_CONFIG'))['mode'])" 2>/dev/null)
+                    base_mode=$(_vpn_yaml_top_scalar "$BASE_CONFIG" mode 2>/dev/null)
                     [ -z "$mode" ] && mode="$base_mode"
                     echo "[vpn] 当前模式: $mode${base_mode:+（base 默认 $base_mode）}"
                     ;;
@@ -988,6 +1229,10 @@ vpn - Mihomo 代理控制命令
 注意:
   - "vpn on/off" 仅影响当前终端；新开终端需再次执行 vpn on
   - 如需永久开启，把 vpn on 加入 ~/.bashrc 末尾即可
+  - 端口设置（优先级：环境变量 > $MIHOMO_DIR/ports.conf > 默认值）：
+      PROXY_PORT=7890 SOCKS_PORT=7891 HTTP_PORT=7892 CONTROL_PORT=9090
+    每次启动前会检测端口占用，被其他进程占用时会报错并提示处理方法；
+    共享服务器上请为 ports.conf 配置一套专属端口，避免与他人冲突
   - 手动调整 dns/rules/端口请编辑 config.base.yaml（由订阅功能自动生成 config.yaml）
 EOF
             ;;

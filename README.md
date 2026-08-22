@@ -13,7 +13,7 @@
 - `vpn` — proxy process and terminal proxy control (`on`/`off`/`stop`/`restart`/`status`/`test`/`log`)
 - `vpn sub` — subscription management: add, switch, update, and auto-update (`list`/`add`/`use`/`update`/`remove`/`auto`)
 
-No GUI required. Only depends on `curl`, `python3`, and the `mihomo` binary.
+No GUI required. Pure Bash — only depends on `curl` and the `mihomo` binary.
 
 ## Features
 
@@ -24,6 +24,7 @@ No GUI required. Only depends on `curl`, `python3`, and the `mihomo` binary.
 - **Node switching**: `vpn node use` switches the active node instantly via the control API (no restart)
 - **Global mode**: `vpn global on` routes all traffic through the selected node
 - **Generated config**: `config.yaml` is generated from `config.base.yaml` plus the active subscription's proxy-providers; manual settings like dns/rules/ports are preserved
+- **Port management**: ports configurable via env vars or `ports.conf`; every start pre-checks port occupancy and fails fast with a clear reason (shared-server friendly)
 - **Smooth migration**: on first run, an existing `config.yaml` is split into a base config + a default subscription (original backed up as `config.yaml.bak-inline`)
 - **Safe process control**: PID-file based management avoids killing unrelated processes
 
@@ -34,60 +35,45 @@ No GUI required. Only depends on `curl`, `python3`, and the `mihomo` binary.
 Ubuntu / Debian:
 
 ```bash
-sudo apt update && sudo apt install -y curl python3 python3-yaml iproute2
+sudo apt update && sudo apt install -y curl iproute2
 ```
 
 Arch Linux:
 
 ```bash
-sudo pacman -S --needed curl python python-yaml iproute2
+sudo pacman -S --needed curl iproute2
 ```
 
 Fedora:
 
 ```bash
-sudo dnf install -y curl python3 python3-pyyaml iproute
+sudo dnf install -y curl iproute
 ```
 
-### 2. Install the Mihomo core
+### 2. Clone anywhere and run the installer
 
-Use the bundled download script (auto-detects your architecture and fetches the latest release from the [Mihomo releases page](https://github.com/MetaCubeX/mihomo/releases/latest)):
+Clone the repository to **any** directory — no need to copy files into your home directory. The installer registers `vpn.sh` in `~/.bashrc` automatically, creates the data directory, and downloads the Mihomo core if it is missing:
 
 ```bash
-mkdir -p ~/clash && cd ~/clash
-./install-mihomo.sh          # installs to $HOME/clash/mihomo by default
-./mihomo -v                  # verify
+git clone https://github.com/MaxDYF/mihomo-server.git ~/mihomo-server
+cd ~/mihomo-server
+./install.sh                  # data dir defaults to ~/clash
+source ~/.bashrc              # or open a new terminal
 ```
 
-Options: `--dir <path>` to change the install directory, `--version v1.19.30` to pin a specific release.
-
-> Alternatively, install mihomo from your distro's package manager or mirror the binary into `~/clash/` manually.
-
-### 3. Clone the repository
+Options:
 
 ```bash
-git clone https://github.com/MaxDYF/mihomo-server.git ~/clash
+./install.sh --dir ~/myproxy  # custom data directory (exports MIHOMO_DIR in bashrc)
+./install.sh --skip-core      # skip downloading the mihomo binary (place it yourself)
+./install.sh --help           # show help
 ```
 
-> **Migrating from an existing setup?** If you already have a working `config.yaml` (with inline proxies) in `~/clash/`, keep it — the script will automatically split it into a base config + a default subscription on first run (original backed up as `config.yaml.bak-inline`).
->
-> If `~/clash/` does not exist yet, the clone above creates it. If it already exists and is not empty, clone into a temp dir and copy the files over instead:
->
-> ```bash
-> git clone https://github.com/MaxDYF/mihomo-server.git /tmp/mihomo-server
-> cp /tmp/mihomo-server/vpn.sh ~/clash/
-> ```
+The installer is idempotent — re-running it never duplicates bashrc entries. Code lives where you cloned it; runtime data (configs, subscriptions, logs, the core binary) lives in the data directory.
 
-### 4. Load the script
+> **Migrating from an existing setup?** If you already have a working `~/clash/config.yaml` with inline proxies, keep it — on first run the script splits it into a base config + a default subscription (original backed up as `config.yaml.bak-inline`).
 
-Append to `~/.bashrc` (and source it in the current shell):
-
-```bash
-echo '[ -f "$HOME/clash/vpn.sh" ] && source "$HOME/clash/vpn.sh"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### 5. Add your subscription and start
+### 3. Add your subscription and start
 
 ```bash
 vpn sub add "https://your-provider.example/sub?token=xxx" "My Provider"   # add a subscription
@@ -97,12 +83,14 @@ vpn status          # check process / ports / subscription status
 vpn test            # connectivity test
 ```
 
-On the first run the script generates a minimal `config.base.yaml` if none exists. Edit it any time to customize `dns`, `rules`, ports, etc. — `config.yaml` is regenerated from it on every subscription switch/update.
+On a shared server, create `$MIHOMO_DIR/ports.conf` with dedicated ports before starting (see [Ports](#ports)).
 
-### 6. Upgrade
+On the first run the script generates a minimal `config.base.yaml` if none exists. Edit it any time to customize `dns`, `rules`, etc. — `config.yaml` is regenerated from it on every subscription switch/update.
+
+### 4. Upgrade
 
 ```bash
-cd ~/clash && git pull
+cd ~/mihomo-server && git pull    # bashrc 无需改动，重新 source 或新开终端即可
 ```
 
 ## Quick Start
@@ -138,16 +126,23 @@ vpn status                    # process / port / subscription status
 
 ## Directory Layout
 
+Code and data are separated — clone location only holds the scripts:
+
 ```
-clash/
+mihomo-server/          # wherever you cloned (bashrc points here)
 ├── vpn.sh              # main script (loaded via source)
-├── install-mihomo.sh   # mihomo core downloader (latest release)
-├── config.base.yaml    # base config template (edit dns/rules/ports here)
+├── install.sh          # one-shot installer (bashrc + data dir + core)
+└── install-mihomo.sh   # mihomo core downloader (latest release)
+
+~/clash/                # $MIHOMO_DIR — runtime data (default)
+├── config.base.yaml    # base config template (edit dns/rules here)
+├── ports.conf          # optional: persistent port overrides (KEY=VALUE)
 ├── config.yaml         # auto-generated (base + active subscription)
 ├── subs/               # subscription files and registry
 │   ├── subs.list       # subscription registry (id/name/URL/update time)
 │   ├── subs.active     # currently active subscription
 │   └── subs.auto       # auto-update toggle
+├── mihomo.log / mihomo.pid / cache.db
 └── mihomo              # core binary (downloaded, not tracked)
 ```
 
@@ -157,7 +152,29 @@ Files marked with `.gitignore` (`config.yaml`, `config.base.yaml`, `subs/`, logs
 
 - `bash` 4+
 - `mihomo` (Clash Meta core, v1.18+)
-- `curl`, `python3` (with PyYAML), `ss` (iproute2)
+- `curl`, `ss` (iproute2)
+
+## Ports
+
+Listen ports are configurable with environment variables or `$MIHOMO_DIR/ports.conf` (a `KEY=VALUE` file; environment variables win):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PROXY_PORT` | `7890` | mixed (HTTP+SOCKS) proxy port |
+| `SOCKS_PORT` | `7891` | standalone SOCKS5 port |
+| `HTTP_PORT` | `7892` | standalone HTTP port |
+| `CONTROL_PORT` | `9090` | external controller (REST API) |
+
+Ports set this way are injected into the generated `config.yaml` on every regeneration. Without them, ports configured in `config.base.yaml` are preserved.
+
+Before every start, the script checks each required port: if a port is held by another process (e.g. another user's instance on a shared server), startup aborts with a clear message instead of silently failing to bind. Example `ports.conf`:
+
+```ini
+PROXY_PORT=17890
+SOCKS_PORT=17891
+HTTP_PORT=17892
+CONTROL_PORT=19090
+```
 
 ## License
 

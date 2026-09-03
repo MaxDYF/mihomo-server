@@ -23,6 +23,7 @@ No GUI required. Pure Bash — only depends on `curl` and the `mihomo` binary.
 - **Auto-update**: with `vpn sub auto on`, `vpn on` / `vpn restart` automatically check for stale subscriptions (default 24h) and refresh silently
 - **Node switching**: `vpn node use` switches the active node instantly via the control API (no restart)
 - **Global mode**: `vpn global on` routes all traffic through the selected node
+- **Local upstream proxy**: chain subscription nodes through a local SOCKS5/HTTP proxy with `LOCAL_PROXY`
 - **Generated config**: `config.yaml` is generated from `config.base.yaml` plus the active subscription's proxy-providers; manual settings like dns/rules/ports are preserved
 - **Port management**: ports configurable via env vars or `ports.conf`; every start pre-checks port occupancy and fails fast with a clear reason (shared-server friendly)
 - **Smooth migration**: on first run, an existing `config.yaml` is split into a base config + a default subscription (original backed up as `config.yaml.bak-inline`)
@@ -102,6 +103,7 @@ vpn sub list                  # list subscriptions
 vpn sub use My-Provider       # switch subscription
 vpn sub update                # manually update the active subscription
 vpn status                    # process / port / subscription status
+vpn local-proxy on socks5://localhost:9632  # chain node traffic through a local proxy
 ```
 
 ## Command Reference
@@ -122,6 +124,7 @@ vpn status                    # process / port / subscription status
 | `vpn node list` | List nodes of the current subscription (`*` marks the active one) |
 | `vpn node use <name\|number>` | Switch the active node instantly (no restart) |
 | `vpn node auto` | Switch back to auto-select (latency-based) |
+| `vpn local-proxy on <URL>` / `off` | Route subscription node connections through a local proxy |
 | `vpn global on\|off` | Enable/disable global mode (all traffic through the selected node) |
 
 ## Directory Layout
@@ -136,7 +139,7 @@ mihomo-server/          # wherever you cloned (bashrc points here)
 
 ~/clash/                # $MIHOMO_DIR — runtime data (default)
 ├── config.base.yaml    # base config template (edit dns/rules here)
-├── ports.conf          # optional: persistent port overrides (KEY=VALUE)
+├── ports.conf          # optional: persistent ports/local proxy settings (KEY=VALUE)
 ├── config.yaml         # auto-generated (base + active subscription)
 ├── subs/               # subscription files and registry
 │   ├── subs.list       # subscription registry (id/name/URL/update time)
@@ -175,6 +178,21 @@ SOCKS_PORT=17891
 HTTP_PORT=17892
 CONTROL_PORT=19090
 ```
+
+### Local upstream proxy
+
+Set `LOCAL_PROXY` in `$MIHOMO_DIR/ports.conf` (or export it before sourcing `vpn.sh`), reload `vpn.sh`, and regenerate the config:
+
+```ini
+LOCAL_PROXY=socks5://localhost:9632
+```
+
+```bash
+source /path/to/mihomo-server/vpn.sh
+vpn restart
+```
+
+You can also set it for the current shell with `vpn local-proxy on socks5://localhost:9632`, or disable it with `vpn local-proxy off`. Mihomo applies the proxy as `dialer-proxy` to subscription nodes; `DIRECT` rules remain direct.
 
 ## License
 

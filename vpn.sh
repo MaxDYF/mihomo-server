@@ -7,6 +7,7 @@
 #   vpn status   查看 Mihomo 进程、端口、代理、订阅状态
 #   vpn restart  重启 Mihomo 进程
 #   vpn log      查看 Mihomo 最近日志
+#   vpn local-proxy 设置/关闭本地上游代理
 #   vpn sub ...  订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
 #
 # 设计要点：
@@ -47,6 +48,69 @@ _vpn_conf_get() {
             return 0
         fi
     done < "$f"
+}
+
+# 可选上游本地代理：订阅节点经此代理建立连接，例如 socks5://localhost:9632
+# 优先级：环境变量 > ports.conf；为空表示关闭
+LOCAL_PROXY="${LOCAL_PROXY:-$(_vpn_conf_get LOCAL_PROXY)}"
+
+# ponytail: only unauthenticated host:port URLs; add credential parsing if needed.
+_vpn_local_proxy_parse() {
+    local url="$LOCAL_PROXY" authority host port
+    case "$url" in
+        socks5://*) LOCAL_PROXY_TYPE=socks5; authority="${url#socks5://}" ;;
+        http://*) LOCAL_PROXY_TYPE=http; authority="${url#http://}" ;;
+        *)
+            echo "[vpn] 错误：LOCAL_PROXY 仅支持 socks5://host:port 或 http://host:port" >&2
+            return 1
+            ;;
+    esac
+
+    case "$authority" in
+        ''|*'@'*|*'/'*|*'?'*|*'#'*)
+            echo "[vpn] 错误：LOCAL_PROXY 地址无效：$LOCAL_PROXY" >&2
+            return 1
+            ;;
+        \[*\]:*)
+            host="${authority#\[}"
+            host="${host%%\]:*}"
+            port="${authority##*\]:}"
+            [ "$authority" = "[$host]:$port" ] || {
+                echo "[vpn] 错误：LOCAL_PROXY 地址无效：$LOCAL_PROXY" >&2
+                return 1
+            }
+            ;;
+        *:*)
+            host="${authority%:*}"
+            port="${authority##*:}"
+            case "$host" in *:*)
+                echo "[vpn] 错误：IPv6 地址请使用 [::1]:port 格式" >&2
+                return 1
+                ;;
+            esac
+            ;;
+        *)
+            echo "[vpn] 错误：LOCAL_PROXY 必须包含端口：$LOCAL_PROXY" >&2
+            return 1
+            ;;
+    esac
+
+    case "$host" in ''|*[!A-Za-z0-9._:-]*)
+        echo "[vpn] 错误：LOCAL_PROXY 主机名无效：$LOCAL_PROXY" >&2
+        return 1
+        ;;
+    esac
+    case "$port" in ''|*[!0-9]*)
+        echo "[vpn] 错误：LOCAL_PROXY 端口无效：$LOCAL_PROXY" >&2
+        return 1
+        ;;
+    esac
+    if ((10#$port < 1 || 10#$port > 65535)); then
+        echo "[vpn] 错误：LOCAL_PROXY 端口必须在 1-65535：$LOCAL_PROXY" >&2
+        return 1
+    fi
+    LOCAL_PROXY_SERVER="$host"
+    LOCAL_PROXY_PORT="$port"
 }
 
 # 用户显式设置的端口值（环境变量或 ports.conf）；为空表示未显式指定，
@@ -538,6 +602,7 @@ _vpn_sub_gen_config() {
     local id="$1" mode tmp strip qn
     [ -f "$BASE_CONFIG" ] || { echo "[vpn] 错误：缺少基础配置 $BASE_CONFIG" >&2; return 1; }
     [ -f "$SUBS_DIR/$id.yaml" ] || { echo "[vpn] 错误：缺少订阅文件 $SUBS_DIR/$id.yaml" >&2; return 1; }
+    [ -z "$LOCAL_PROXY" ] || _vpn_local_proxy_parse || return 1
     mode=$(_vpn_current_mode)
 
     # 剥离由脚本统一注入的顶层键；端口仅在显式设置时接管（否则保留 base 原值）
@@ -572,12 +637,31 @@ EOF
             [ -n "$VPN_HTTP_PORT_SET" ] && echo "port: $VPN_HTTP_PORT_SET"
         fi
 
+        if [ -n "$LOCAL_PROXY" ]; then
+            cat <<EOF
+
+proxies:
+  - name: local-proxy
+    type: $LOCAL_PROXY_TYPE
+    server: $LOCAL_PROXY_SERVER
+    port: $LOCAL_PROXY_PORT
+EOF
+        fi
+
         cat <<EOF
 
 proxy-providers:
   $id:
     type: file
     path: subs/$id.yaml
+EOF
+        if [ -n "$LOCAL_PROXY" ]; then
+            cat <<EOF
+    override:
+      dialer-proxy: local-proxy
+EOF
+        fi
+        cat <<EOF
     health-check:
       enable: true
       url: $SUB_HEALTH_URL
@@ -1133,6 +1217,12 @@ vpn() {
             else
                 echo "  未设置（当前终端不走代理）"
             fi
+            echo "===== 本地上游代理 ====="
+            if [ -n "$LOCAL_PROXY" ]; then
+                echo "  $LOCAL_PROXY（订阅节点通过 dialer-proxy 出站）"
+            else
+                echo "  未设置"
+            fi
             echo "===== 订阅 ====="
             if [ -s "$SUBS_ACTIVE" ] 2>/dev/null; then
                 _vpn_sub_ensure
@@ -1183,6 +1273,34 @@ vpn() {
             shift
             vpn_node "$@"
             ;;
+        local-proxy|upstream)
+            local arg="${2:-status}" url
+            case "$arg" in
+                on|set)
+                    url="${3:-}"
+                    [ -n "$url" ] || {
+                        echo "用法: vpn local-proxy on <socks5://host:port|http://host:port>" >&2
+                        return 1
+                    }
+                    LOCAL_PROXY="$url"
+                    _vpn_sub_regen_restart || return 1
+                    echo "[vpn] 已设置本地上游代理: $LOCAL_PROXY"
+                    ;;
+                off|disable)
+                    LOCAL_PROXY=""
+                    _vpn_sub_regen_restart || return 1
+                    echo "[vpn] 已关闭本地上游代理"
+                    ;;
+                status)
+                    [ -n "$LOCAL_PROXY" ] && echo "[vpn] 本地上游代理: $LOCAL_PROXY" \
+                        || echo "[vpn] 本地上游代理: 未设置"
+                    ;;
+                *)
+                    echo "用法: vpn local-proxy on <URL>|off|status" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
         global|mode)
             local arg="${2:-status}"
             case "$arg" in
@@ -1223,6 +1341,7 @@ vpn - Mihomo 代理控制命令
   vpn log [N]   查看最近 N 行日志（默认 30）
   vpn sub       订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
   vpn node      节点切换：list/use/auto/show（规则模式选 🚀节点选择）
+  vpn local-proxy  设置本地上游代理（如 socks5://localhost:9632）
   vpn global    全局模式 on|off|status（所有流量走选中的节点）
   vpn help      显示本帮助
 
@@ -1233,12 +1352,14 @@ vpn - Mihomo 代理控制命令
       PROXY_PORT=7890 SOCKS_PORT=7891 HTTP_PORT=7892 CONTROL_PORT=9090
     每次启动前会检测端口占用，被其他进程占用时会报错并提示处理方法；
     共享服务器上请为 ports.conf 配置一套专属端口，避免与他人冲突
+  - 本地上游代理可写入 $PORTS_CONF：LOCAL_PROXY=socks5://localhost:9632，
+    或用 vpn local-proxy on <URL> 临时设置；订阅节点通过该代理出站，DIRECT 仍直连
   - 手动调整 dns/rules/端口请编辑 config.base.yaml（由订阅功能自动生成 config.yaml）
 EOF
             ;;
         *)
             echo "[vpn] 未知子命令: $cmd" >&2
-            echo "  用法: vpn on|off|stop|status|restart|test|log|sub|node|global|help" >&2
+            echo "  用法: vpn on|off|stop|status|restart|test|log|sub|node|local-proxy|global|help" >&2
             return 2
             ;;
     esac

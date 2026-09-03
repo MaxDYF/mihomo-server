@@ -168,6 +168,15 @@ Listen ports are configurable with environment variables or `$MIHOMO_DIR/ports.c
 | `HTTP_PORT` | `7892` | standalone HTTP port |
 | `CONTROL_PORT` | `9090` | external controller (REST API) |
 
+The easiest way to configure ports is the built-in command, which persists to `ports.conf` and hot-restarts a running instance:
+
+```bash
+vpn port                                  # show current ports and their source
+vpn port set 27890                        # change only the mixed proxy port
+vpn port set 27890 27891 27892 29090      # set all four
+vpn port reset                            # back to defaults
+```
+
 Ports set this way are injected into the generated `config.yaml` on every regeneration. Without them, ports configured in `config.base.yaml` are preserved.
 
 Before every start, the script checks each required port: if a port is held by another process (e.g. another user's instance on a shared server), startup aborts with a clear message instead of silently failing to bind. Example `ports.conf`:

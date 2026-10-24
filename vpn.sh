@@ -8,7 +8,7 @@
 #   vpn restart  重启 Mihomo 进程
 #   vpn log      查看 Mihomo 最近日志
 #   vpn local-proxy 设置/关闭本地上游代理
-#   vpn sub ...  订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
+#   vpn sub ...  订阅管理：list/add/import/use/update/remove/auto（详见 vpn sub help）
 #
 # 设计要点：
 #   - 进程控制用 PID 文件和 kill，避免按模糊进程名误杀
@@ -246,6 +246,7 @@ _vpn_start_mihomo() {
         aid="$(cat "$SUBS_ACTIVE" 2>/dev/null || true)"
         if [ -z "$aid" ] || [ ! -f "$SUBS_DIR/$aid.yaml" ]; then
             echo "[vpn] 请先添加订阅: vpn sub add <订阅URL> [名称]" >&2
+            echo "[vpn] 或离线导入已有配置: vpn sub import /path/to/config.yaml [名称]" >&2
         else
             echo "[vpn] 订阅已存在但配置生成失败，请重试: vpn sub use \"$aid\"" >&2
         fi
@@ -380,9 +381,15 @@ _vpn_sub_url_decode() {
 
 _vpn_sub_fetch() {
     local url="$1" out="$2" real
+    local -a proxy_args=()
     real=$(_vpn_sub_url_decode "$url")
+    if [ -n "$LOCAL_PROXY" ]; then
+        _vpn_local_proxy_parse || return 1
+        # SOCKS5 使用代理端 DNS，避免首次下载时本机无法解析订阅域名。
+        proxy_args=(--proxy "${LOCAL_PROXY/#socks5:/socks5h:}" --noproxy "")
+    fi
     curl -fsSL --max-time "$SUB_DOWNLOAD_TIMEOUT" --retry 1 \
-        -A "$SUB_UA" -o "$out" "$real" 2>/dev/null
+        "${proxy_args[@]}" -A "$SUB_UA" -o "$out" "$real" 2>/dev/null
 }
 
 # ---- 纯 Shell 工具集（替代原内嵌 Python：URL 编码 / JSON 解析 / YAML 处理）----
@@ -837,6 +844,25 @@ _vpn_sub_regen_restart() {
     fi
 }
 
+_vpn_local_proxy_set() {
+    local previous="$LOCAL_PROXY"
+    LOCAL_PROXY="$1"
+    if [ -n "$LOCAL_PROXY" ] && ! _vpn_local_proxy_parse; then
+        LOCAL_PROXY="$previous"
+        return 1
+    fi
+
+    _vpn_sub_ensure
+    if [ -s "$SUBS_ACTIVE" ]; then
+        if ! _vpn_sub_regen_restart; then
+            LOCAL_PROXY="$previous"
+            return 1
+        fi
+    else
+        echo "[vpn] 暂无订阅，本地上游代理设置已生效，可直接 vpn sub add"
+    fi
+}
+
 _vpn_sub_update_one() {
     # 返回值：0=有更新 1=失败 2=无变化
     local id="$1" url raw tmp out n rc
@@ -925,13 +951,25 @@ vpn_sub() {
             echo "自动更新: $auto（间隔 $((SUB_UPDATE_INTERVAL / 3600))h，vpn on/restart 时检查）"
             ;;
 
-        add)
-            _vpn_sub_ensure
-            local url="$2" name="$3" id next n tmp
+        add|import)
+            local url="${2:-}" name="${3:-}" id next n tmp source_file=""
             if [ -z "$url" ]; then
-                echo "用法: vpn sub add <订阅URL> [名称]" >&2
+                if [ "$cmd" = import ]; then
+                    echo "用法: vpn sub import <config.yaml路径> [名称]" >&2
+                else
+                    echo "用法: vpn sub add <订阅URL> [名称]" >&2
+                fi
                 return 1
             fi
+            if [ "$cmd" = import ]; then
+                source_file="$url"
+                [ -f "$source_file" ] && [ -r "$source_file" ] && [ -s "$source_file" ] || {
+                    echo "[vpn] 无法读取本地配置文件: $source_file" >&2
+                    return 1
+                }
+                url=local
+            fi
+            _vpn_sub_ensure
             next=$(($(wc -l < "$SUBS_LIST" 2>/dev/null) + 1))
             while grep -qF "$(printf 'sub_%s\t' "$next")" "$SUBS_LIST" 2>/dev/null; do
                 next=$((next + 1))
@@ -939,16 +977,24 @@ vpn_sub() {
             id="sub_$next"
             [ -n "$name" ] || name="订阅-$next"
             name=$(printf '%s' "$name" | tr '\t\n' '  ')
-            echo "[vpn] 正在下载订阅..."
             tmp="$SUBS_DIR/.$id.dl.$$"
-            if ! _vpn_sub_fetch "$url" "$tmp"; then
-                rm -f "$tmp"
-                echo "[vpn] 下载失败，请检查 URL 与网络" >&2
-                return 1
+            if [ -n "$source_file" ]; then
+                echo "[vpn] 正在导入本地配置..."
+                if ! cp -- "$source_file" "$tmp"; then
+                    rm -f "$tmp"
+                    return 1
+                fi
+            else
+                echo "[vpn] 正在下载订阅..."
+                if ! _vpn_sub_fetch "$url" "$tmp"; then
+                    rm -f "$tmp"
+                    echo "[vpn] 下载失败，请检查 URL 与网络" >&2
+                    return 1
+                fi
             fi
             if ! n=$(_vpn_sub_normalize "$tmp" "$SUBS_DIR/$id.yaml"); then
                 rm -f "$tmp"
-                echo "[vpn] 订阅内容解析失败（需为 Clash 配置 / 代理列表 / base64 订阅）" >&2
+                echo "[vpn] 订阅内容解析失败（需包含节点的 Clash 配置 / 代理列表 / base64 订阅）" >&2
                 return 1
             fi
             mv -f "$tmp" "$SUBS_DIR/$id.raw"
@@ -1075,6 +1121,7 @@ vpn sub - 订阅管理命令
 子命令:
   vpn sub list                  列出所有订阅（* 为当前使用）
   vpn sub add <URL> [名称]      添加订阅（clash yaml / base64 / sub:// / json 均可）
+  vpn sub import <文件> [名称]  从本地 config.yaml 导入节点，无需联网
   vpn sub use <名称|ID>         切换当前订阅（重新生成 config.yaml 并重启）
   vpn sub update [all|名称|ID]  更新订阅（默认当前订阅；all 更新全部）
   vpn sub remove <名称|ID>      删除订阅
@@ -1084,6 +1131,8 @@ vpn sub - 订阅管理命令
 说明:
   - 订阅文件保存在 $SUBS_DIR/，config.yaml 由 $BASE_CONFIG 自动生成
   - 手动调整 dns/rules/端口请编辑 $BASE_CONFIG
+  - 首次无法下载订阅时，可先 vpn sub import /path/config.yaml，再 vpn on
+    导入文件需包含实际节点（proxies）；使用现有基础配置，之后可添加在线订阅
   - 第一次运行时，现有 config.yaml 会被抽离为基础配置 + 默认订阅
     （原文件备份为 config.yaml.bak-inline）
 EOF
@@ -1091,7 +1140,7 @@ EOF
 
         *)
             echo "[vpn] 未知子命令: $cmd" >&2
-            echo "  用法: vpn sub list|add|use|update|remove|auto|check|help" >&2
+            echo "  用法: vpn sub list|add|import|use|update|remove|auto|check|help" >&2
             return 2
             ;;
     esac
@@ -1503,13 +1552,11 @@ vpn() {
                         echo "用法: vpn local-proxy on <socks5://host:port|http://host:port>" >&2
                         return 1
                     }
-                    LOCAL_PROXY="$url"
-                    _vpn_sub_regen_restart || return 1
+                    _vpn_local_proxy_set "$url" || return 1
                     echo "[vpn] 已设置本地上游代理: $LOCAL_PROXY"
                     ;;
                 off|disable)
-                    LOCAL_PROXY=""
-                    _vpn_sub_regen_restart || return 1
+                    _vpn_local_proxy_set "" || return 1
                     echo "[vpn] 已关闭本地上游代理"
                     ;;
                 status)
@@ -1564,7 +1611,7 @@ vpn - Mihomo 代理控制命令
   vpn status    查看状态（进程/端口/代理/订阅）
   vpn test      测试连通性（Google/GitHub/Baidu）
   vpn log [N]   查看最近 N 行日志（默认 30）
-  vpn sub       订阅管理：list/add/use/update/remove/auto（详见 vpn sub help）
+  vpn sub       订阅管理：list/add/import/use/update/remove/auto（详见 vpn sub help）
   vpn node      节点切换：list/use/auto/show（规则模式选 🚀节点选择）
   vpn local-proxy  设置本地上游代理（如 socks5://localhost:9632）
   vpn port      端口设置：show/set/reset（写入 ports.conf，运行中自动重启生效）
@@ -1579,7 +1626,8 @@ vpn - Mihomo 代理控制命令
     每次启动前会检测端口占用，被其他进程占用时会报错并提示处理方法；
     共享服务器上请为 ports.conf 配置一套专属端口，避免与他人冲突
   - 本地上游代理可写入 $PORTS_CONF：LOCAL_PROXY=socks5://localhost:9632，
-    或用 vpn local-proxy on <URL> 临时设置；订阅节点通过该代理出站，DIRECT 仍直连
+    或用 vpn local-proxy on <URL> 临时设置，无需先添加订阅；订阅下载也使用该代理
+    订阅节点通过该代理出站，DIRECT 规则仍直连
   - 手动调整 dns/rules/端口请编辑 config.base.yaml（由订阅功能自动生成 config.yaml）
 EOF
             ;;

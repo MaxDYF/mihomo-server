@@ -103,6 +103,10 @@ cat <<EOF
   2. 共享服务器建议先设置专属端口（避免与他人冲突）:
        vpn port set 27890 27891 27892 29090
   3. 添加订阅并启动:
+       # 若下载订阅需要本地代理，可先设置（无需已有订阅）：
+       # vpn local-proxy on socks5://localhost:9632
+       # 也可先离线导入已有配置，再 vpn on 联网下载订阅：
+       # vpn sub import /path/to/config.yaml "本地配置"
        vpn sub add "<订阅URL>" "我的订阅"
        vpn on
 

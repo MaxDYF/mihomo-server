@@ -11,7 +11,7 @@
 `mihomo-server` is a pure-Bash control script for Mihomo. Load it with `source` and control your proxy from the terminal:
 
 - `vpn` — proxy process and terminal proxy control (`on`/`off`/`stop`/`restart`/`status`/`test`/`log`)
-- `vpn sub` — subscription management: add, switch, update, and auto-update (`list`/`add`/`use`/`update`/`remove`/`auto`)
+- `vpn sub` — subscription management: add, import local files, switch, update, and auto-update (`list`/`add`/`import`/`use`/`update`/`remove`/`auto`)
 
 No GUI required. Pure Bash — only depends on `curl` and the `mihomo` binary.
 
@@ -19,6 +19,7 @@ No GUI required. Pure Bash — only depends on `curl` and the `mihomo` binary.
 
 - **One-command proxy**: `vpn on` starts Mihomo and enables the terminal proxy; `vpn off` disables the proxy without killing the process
 - **Multiple subscriptions**: keep several airport/provider subscriptions and switch with `vpn sub use`
+- **Offline bootstrap**: import nodes from a working local `config.yaml`, connect, then download online subscriptions
 - **Subscription format support**: Clash YAML / plain proxy lists / base64 subscriptions / `sub://` links / JSON
 - **Auto-update**: with `vpn sub auto on`, `vpn on` / `vpn restart` automatically check for stale subscriptions (default 24h) and refresh silently
 - **Node switching**: `vpn node use` switches the active node instantly via the control API (no restart)
@@ -76,6 +77,12 @@ The installer is idempotent — re-running it never duplicates bashrc entries. C
 
 ### 3. Add your subscription and start
 
+If this device needs a local proxy to access the subscription URL, configure it first:
+
+```bash
+vpn local-proxy on socks5://localhost:9632  # optional; no subscription required
+```
+
 ```bash
 vpn sub add "https://your-provider.example/sub?token=xxx" "My Provider"   # add a subscription
 vpn sub list        # verify it was downloaded (node count shown)
@@ -88,6 +95,17 @@ On a shared server, create `$MIHOMO_DIR/ports.conf` with dedicated ports before 
 
 On the first run the script generates a minimal `config.base.yaml` if none exists. Edit it any time to customize `dns`, `rules`, etc. — `config.yaml` is regenerated from it on every subscription switch/update.
 
+If you already have a working `config.yaml`, you can import it without downloading a subscription first:
+
+```bash
+vpn sub import /path/to/config.yaml "Local Config"
+vpn on
+vpn sub add "https://your-provider.example/sub?token=xxx" "My Provider"
+vpn sub use "My Provider"
+```
+
+The import reads the file's actual proxy nodes (`proxies`) into a local subscription and uses the existing `config.base.yaml` for DNS, rules, and ports. The first imported subscription becomes active automatically; importing another one keeps the current selection. Local imports have no update URL and are skipped during updates. A file containing only remote provider URLs needs its nodes downloaded first.
+
 ### 4. Upgrade
 
 ```bash
@@ -97,13 +115,13 @@ cd ~/mihomo-server && git pull    # bashrc 无需改动，重新 source 或新�
 ## Quick Start
 
 ```bash
-vpn on                        # start proxy and enable terminal proxy
+vpn local-proxy on socks5://localhost:9632  # optional; set before adding a subscription
 vpn sub add "https://example.com/sub?token=xxx" "My Provider"
+vpn on                        # start proxy and enable terminal proxy
 vpn sub list                  # list subscriptions
 vpn sub use My-Provider       # switch subscription
 vpn sub update                # manually update the active subscription
 vpn status                    # process / port / subscription status
-vpn local-proxy on socks5://localhost:9632  # chain node traffic through a local proxy
 ```
 
 ## Command Reference
@@ -117,6 +135,7 @@ vpn local-proxy on socks5://localhost:9632  # chain node traffic through a local
 | `vpn log [N]` | Show last N log lines |
 | `vpn sub list` | List all subscriptions (`*` marks the active one) |
 | `vpn sub add <URL> [name]` | Add a subscription |
+| `vpn sub import <file> [name]` | Import nodes from a local `config.yaml` without network access |
 | `vpn sub use <name\|ID>` | Switch the active subscription |
 | `vpn sub update [all\|name\|ID]` | Update subscription(s) |
 | `vpn sub remove <name\|ID>` | Remove a subscription |
@@ -124,7 +143,7 @@ vpn local-proxy on socks5://localhost:9632  # chain node traffic through a local
 | `vpn node list` | List nodes of the current subscription (`*` marks the active one) |
 | `vpn node use <name\|number>` | Switch the active node instantly (no restart) |
 | `vpn node auto` | Switch back to auto-select (latency-based) |
-| `vpn local-proxy on <URL>` / `off` | Route subscription node connections through a local proxy |
+| `vpn local-proxy on <URL>` / `off` | Set/disable a local proxy for subscription downloads and node connections (no subscription required) |
 | `vpn global on\|off` | Enable/disable global mode (all traffic through the selected node) |
 
 ## Directory Layout
@@ -201,7 +220,7 @@ source /path/to/mihomo-server/vpn.sh
 vpn restart
 ```
 
-You can also set it for the current shell with `vpn local-proxy on socks5://localhost:9632`, or disable it with `vpn local-proxy off`. Mihomo applies the proxy as `dialer-proxy` to subscription nodes; `DIRECT` rules remain direct.
+You can also set it for the current shell with `vpn local-proxy on socks5://localhost:9632`, or disable it with `vpn local-proxy off`. This works before adding any subscription: subscription downloads and updates use the local proxy immediately, with DNS resolved by the proxy for SOCKS5. Once a subscription is active, changing the local proxy regenerates the config and restarts a running Mihomo instance. Mihomo applies the proxy as `dialer-proxy` to subscription nodes; `DIRECT` rules remain direct.
 
 ## License
 
